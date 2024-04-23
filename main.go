@@ -69,6 +69,8 @@ func (a Listener) OnAddLog(client *PoolClient, value string) {
 }
 
 func FormatTable(header []string, rows [][]string) string {
+	const MAX_LEN = 16
+
 	table := strings.Builder{}
 	table.WriteString("```\n")
 	cols := make([]int, len(rows))
@@ -79,7 +81,11 @@ func FormatTable(header []string, rows [][]string) string {
 	for j, col := range rows {
 		rowcnt = len(col)
 		for _, cell := range col {
-			lv := len([]rune(cell)) + 2
+			lv := len([]rune(cell))
+			if lv > MAX_LEN {
+				lv = MAX_LEN
+			}
+			lv+=2
 			if lv > cols[j] {
 				cols[j] = lv
 			}
@@ -103,9 +109,16 @@ func FormatTable(header []string, rows [][]string) string {
 		table.WriteString("|")
 		for j := range rows {
 			cell := rows[j][i]
-			l := len([]rune(cell))
-			s := " " + cell + strings.Repeat(" ", cols[j]-l-1)
-			table.WriteString(s)
+			cellRunes := []rune(cell)
+			l := len(cellRunes)
+			table.WriteString(" ")
+			if l > MAX_LEN {
+				table.WriteString(string(cellRunes[0 : MAX_LEN-3]))
+				table.WriteString("...")
+			} else {
+				table.WriteString(cell)
+			}
+			table.WriteString(strings.Repeat(" ", cols[j]-l-1))
 			table.WriteString("|")
 		}
 	}

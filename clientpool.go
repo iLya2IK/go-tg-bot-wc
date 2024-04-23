@@ -170,7 +170,7 @@ type PoolUpdateMsgsListener interface {
 }
 
 type PoolUpdateRecsListener interface {
-	OnUpdateRecs(client *PoolClient, msgs []map[string]any) /* The request to update list of messages has been completed. The response has arrived. */
+	OnUpdateRecs(client *PoolClient, msgs []map[string]any) /* The request to update list of media records has been completed. The response has arrived. */
 }
 
 type PoolUpdateDevicesListener interface {
