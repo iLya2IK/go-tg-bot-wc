@@ -3,12 +3,15 @@ package main
 import (
 	"container/list"
 	"encoding/json"
+	"fmt"
 	"net/url"
+	"reflect"
 	"sync"
+	"time"
 
 	sqlite "crawshaw.io/sqlite"
 	sqlitex "crawshaw.io/sqlite/sqlitex"
-	wc "github.com/ilya2ik/wcwebcamclient_go/lib"
+	wc "github.com/ilya2ik/wcwebcamclient_go"
 )
 
 type TgUserId struct {
@@ -166,6 +169,10 @@ type PoolUpdateMsgsListener interface {
 	OnUpdateMsgs(client *PoolClient, msgs []map[string]any) /* The request to update list of messages has been completed. The response has arrived. */
 }
 
+type PoolUpdateRecsListener interface {
+	OnUpdateRecs(client *PoolClient, msgs []map[string]any) /* The request to update list of messages has been completed. The response has arrived. */
+}
+
 type PoolUpdateDevicesListener interface {
 	OnUpdateDevices(client *PoolClient, devices []map[string]any) /* The request to update list of online devices has been completed. The response has arrived. */
 }
@@ -192,25 +199,119 @@ type PoolUpdateDevicesListener interface {
 //	onSuccessRequestRecordMeta JSONNotifyEventFunc      /* The request to get metadata for the media record has been completed. The response has arrived. */
 //	onSuccessDeleteRecords     TaskNotifyFunc           /* The request to delete records has been completed. The response has arrived. */
 
+type WCUpdateType int
+
+const (
+	Message WCUpdateType = iota
+	Media
+)
+
+type WCUpdate struct {
+	Client *PoolClient
+	Type   WCUpdateType
+	Msg    *wc.MessageStruct
+	Data   []byte
+}
+
+type PoolUpdate chan WCUpdate
+
+/* LockableStmt decl */
+
+type LockableStmt struct {
+	mux  sync.Mutex
+	stmt *sqlite.Stmt
+}
+
+/* LockableStmt impl */
+
+func PrepareStmt(db *sqlite.Conn, sql string) (*LockableStmt, error) {
+	res := LockableStmt{}
+	var err error
+	res.stmt, err = db.Prepare(sql)
+	if err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+func (stmt *LockableStmt) bind(bindings map[int]any) error {
+	for key, v := range bindings {
+		switch reflect.TypeOf(v).Kind() {
+		case reflect.Int64, reflect.Int32:
+			stmt.stmt.BindInt64(key, v.(int64))
+		case reflect.Float32, reflect.Float64:
+			stmt.stmt.BindFloat(key, v.(float64))
+		case reflect.String:
+			stmt.stmt.BindText(key, v.(string))
+		default:
+			return fmt.Errorf("Wrong type of binding %d, %v", key, v)
+		}
+	}
+	return nil
+}
+
+func (stmt *LockableStmt) DoUpdate(bindings map[int]any) error {
+	stmt.Lock()
+	defer stmt.UnLock()
+
+	stmt.bind(bindings)
+
+	if _, err := stmt.stmt.Step(); err != nil {
+		return err
+	}
+
+	return stmt.stmt.Reset()
+}
+
+func (stmt *LockableStmt) DoSelectRow(bindings map[int]any, cols []string) (map[string]string, error) {
+	stmt.Lock()
+	defer stmt.UnLock()
+
+	stmt.bind(bindings)
+
+	if hasRow, err := stmt.stmt.Step(); err != nil {
+		return nil, err
+	} else if hasRow {
+		result := make(map[string]string)
+		for _, rec := range cols {
+			result[rec] = stmt.stmt.GetText(rec)
+		}
+		return result, stmt.stmt.Reset()
+	}
+	return nil, sqlitex.ErrNoResults
+}
+
+func (stmt *LockableStmt) Lock() {
+	stmt.mux.Lock()
+}
+
+func (stmt *LockableStmt) UnLock() {
+	stmt.mux.Unlock()
+}
+
 /* Pool decl */
 
 type Pool struct {
 	mux     sync.Mutex
-	stmtmux sync.Mutex
 	listmux sync.Mutex
 
 	client_db *sqlite.Conn
 	// Prepares
-	adduser_stmt  *sqlite.Stmt
-	getuser_stmt  *sqlite.Stmt
-	upduser_stmt  *sqlite.Stmt
-	addlogin_stmt *sqlite.Stmt
-	getlogin_stmt *sqlite.Stmt
+	adduser_stmt     *LockableStmt
+	getuser_stmt     *LockableStmt
+	upduser_stmt     *LockableStmt
+	addlogin_stmt    *LockableStmt
+	getlogin_stmt    *LockableStmt
+	getstamps_stmt   *LockableStmt
+	updrecstamp_stmt *LockableStmt
+	updmsgstamp_stmt *LockableStmt
 
 	initial_cfg *wc.WCClientConfig
 
 	value     *list.List
 	listeners *list.List
+
+	updates PoolUpdate
 }
 
 /* Pool impl */
@@ -252,38 +353,47 @@ func NewPool(client_db_loc string, cfg *wc.WCClientConfig) (*Pool, error) {
 		client_db:   db,
 		value:       list.New(),
 		listeners:   list.New(),
+		updates:     make(PoolUpdate, 128),
 	})
 
-	stmt, err := db.Prepare("replace into \"users\" " +
-		"(\"user_id\", \"chat_id\", \"user_name\", \"user_first_name\", \"user_second_name\", \"last_start\") " +
+	pool.adduser_stmt, err = PrepareStmt(db, "replace into \"users\" "+
+		"(\"user_id\", \"chat_id\", \"user_name\", \"user_first_name\", \"user_second_name\", \"last_start\") "+
 		"values (?1, ?2, ?3, ?4, ?5, current_timestamp);")
 	if err != nil {
 		return nil, err
 	}
-	pool.adduser_stmt = stmt
-	stmt, err = db.Prepare("update \"users\" set \"settings\"=?3 where \"user_id\"=?1 and \"chat_id\"=?2;")
+	pool.upduser_stmt, err = PrepareStmt(db, "update \"users\" set \"settings\"=?3 where \"user_id\"=?1 and \"chat_id\"=?2;")
 	if err != nil {
 		return nil, err
 	}
-	pool.upduser_stmt = stmt
-	stmt, err = db.Prepare("select * from \"users\" where \"user_id\"=?1 and \"chat_id\"=?2;")
+	pool.getuser_stmt, err = PrepareStmt(db, "select * from \"users\" where \"user_id\"=?1 and \"chat_id\"=?2;")
 	if err != nil {
 		return nil, err
 	}
-	pool.getuser_stmt = stmt
-	stmt, err = db.Prepare("replace into \"logins\" " +
-		"(\"ext_user_id\", \"ext_chat_id\", \"name\", \"pwd\", \"last_used\") " +
+	pool.addlogin_stmt, err = PrepareStmt(db, "replace into \"logins\" "+
+		"(\"ext_user_id\", \"ext_chat_id\", \"name\", \"pwd\", \"last_used\") "+
 		"values (?1, ?2, ?3, ?4, current_timestamp);")
 	if err != nil {
 		return nil, err
 	}
-	pool.addlogin_stmt = stmt
-	stmt, err = db.Prepare("select \"name\", \"pwd\", \"last_used\" from \"logins\" " +
+	pool.getlogin_stmt, err = PrepareStmt(db, "select \"name\", \"pwd\", \"last_used\" from \"logins\" "+
 		" where \"ext_user_id\"=?1 and \"ext_chat_id\"=?2 order by \"last_used\" desc;")
 	if err != nil {
 		return nil, err
 	}
-	pool.getlogin_stmt = stmt
+	pool.updmsgstamp_stmt, err = PrepareStmt(db, "update \"logins\" set \"msg_stamp\"=?4 where \"ext_user_id\"=?1 and \"ext_chat_id\"=?2 and \"name\"=?3;")
+	if err != nil {
+		return nil, err
+	}
+	pool.updrecstamp_stmt, err = PrepareStmt(db, "update \"logins\" set \"rec_stamp\"=?4 where \"ext_user_id\"=?1 and \"ext_chat_id\"=?2 and \"name\"=?3;")
+	if err != nil {
+		return nil, err
+	}
+	pool.getstamps_stmt, err = PrepareStmt(db, "select \"msg_stamp\", \"rec_stamp\" from \"logins\" "+
+		" where \"ext_user_id\"=?1 and \"ext_chat_id\"=?2 and \"name\"=?3;")
+	if err != nil {
+		return nil, err
+	}
 
 	return pool, nil
 }
@@ -297,6 +407,8 @@ func (pool *Pool) NewPoolClient(cfg *wc.WCClientConfig, id TgUserId, un, fn, ln 
 	if err != nil {
 		return nil, err
 	}
+	c.SetNeedToSync(true)
+	c.SetLstMsgStampToSyncPoint()
 	c.SetOnAuthSuccess(pool.internalAuthSuccess)
 	c.SetOnAddLog(pool.internalOnLog)
 	c.SetOnConnected(pool.internalOnClientStateChange)
@@ -310,22 +422,35 @@ func (pool *Pool) NewPoolClient(cfg *wc.WCClientConfig, id TgUserId, un, fn, ln 
 	return new_pool_client, nil
 }
 
-func (pool *Pool) dbAddCID(id TgUserId, un, fn, ln string) (PoolClientSettings, error) {
-	pool.stmtmux.Lock()
-	defer pool.stmtmux.Unlock()
+func (pool *Pool) GetPoolTimer() PoolUpdate {
+	go func() {
+		for {
+			pool.DoForAll(func(c *PoolClient) bool {
+				if c.client.Working() && (c.GetStatus()&StatusAuthorized > 0) {
+					return true
+				}
+				return false
+			}, pool.UpdateMessages)
 
-	var sett PoolClientSettings
-	pool.getuser_stmt.BindInt64(1, id.user_id)
-	pool.getuser_stmt.BindInt64(2, id.chat_id)
-	if hasRow, err := pool.getuser_stmt.Step(); err != nil {
-		return sett, err
-	} else if hasRow {
-		sett_str := pool.getuser_stmt.GetText("settings")
-		err = json.Unmarshal([]byte(sett_str), &sett)
-		if err != nil {
-			pool.getuser_stmt.Reset()
-			return sett, err
+			time.Sleep(time.Second * 5)
 		}
+	}()
+
+	return pool.updates
+}
+
+func (pool *Pool) dbAddCID(id TgUserId, un, fn, ln string) (PoolClientSettings, error) {
+	const SETTINGS_COL = "settings"
+	var sett PoolClientSettings
+	cols, err := pool.getuser_stmt.DoSelectRow(
+		map[int]any{1: id.user_id, 2: id.chat_id},
+		[]string{SETTINGS_COL})
+	if err != nil && (err != sqlitex.ErrNoResults) {
+		return sett, err
+	}
+
+	if cols != nil {
+		err = json.Unmarshal([]byte(cols[SETTINGS_COL]), &sett)
 		if len(sett.Target) == 0 {
 			sett.Target = ALL_DEVICES
 		}
@@ -333,19 +458,13 @@ func (pool *Pool) dbAddCID(id TgUserId, un, fn, ln string) (PoolClientSettings, 
 			sett.Filter = ALL_FILTER
 		}
 	}
-	err := pool.getuser_stmt.Reset()
-	if err != nil {
-		return sett, err
-	}
-	pool.adduser_stmt.BindInt64(1, id.user_id)
-	pool.adduser_stmt.BindInt64(2, id.chat_id)
-	pool.adduser_stmt.BindText(3, un)
-	pool.adduser_stmt.BindText(4, fn)
-	pool.adduser_stmt.BindText(5, ln)
-	if _, err := pool.adduser_stmt.Step(); err != nil {
-		return sett, err
-	}
-	err = pool.adduser_stmt.Reset()
+
+	err = pool.adduser_stmt.DoUpdate(
+		map[int]any{1: id.user_id,
+			2: id.chat_id,
+			3: un,
+			4: fn,
+			5: ln})
 	return sett, err
 }
 
@@ -378,23 +497,21 @@ func (pool *Pool) Authorize(client *PoolClient) error {
 	if err := client.authorize(); err != nil {
 		return err
 	}
-
-	pool.stmtmux.Lock()
-	defer pool.stmtmux.Unlock()
-
-	pool.addlogin_stmt.BindInt64(1, client.id.user_id)
-	pool.addlogin_stmt.BindInt64(2, client.id.chat_id)
-	pool.addlogin_stmt.BindText(3, client.account.Username())
 	pw, _ := client.account.Password()
-	pool.addlogin_stmt.BindText(4, pw)
-	if _, err := pool.addlogin_stmt.Step(); err != nil {
-		return err
-	}
-	return pool.addlogin_stmt.Reset()
+	err := pool.addlogin_stmt.DoUpdate(
+		map[int]any{1: client.id.user_id,
+			2: client.id.chat_id,
+			3: client.account.Username(),
+			4: pw})
+	return err
 }
 
 func (pool *Pool) UpdateDevices(client *PoolClient) error {
 	return client.client.UpdateDevices(client)
+}
+
+func (pool *Pool) UpdateMessages(client *PoolClient) {
+	client.client.UpdateMsgs(client)
 }
 
 func (pool *Pool) updateClientSettings(client *PoolClient) error {
@@ -403,16 +520,11 @@ func (pool *Pool) updateClientSettings(client *PoolClient) error {
 		return err
 	}
 
-	pool.stmtmux.Lock()
-	defer pool.stmtmux.Unlock()
-
-	pool.upduser_stmt.BindInt64(1, client.id.user_id)
-	pool.upduser_stmt.BindInt64(2, client.id.chat_id)
-	pool.upduser_stmt.BindText(3, string(json_str))
-	if _, err := pool.upduser_stmt.Step(); err != nil {
-		return err
-	}
-	return pool.upduser_stmt.Reset()
+	err = pool.upduser_stmt.DoUpdate(
+		map[int]any{1: client.id.user_id,
+			2: client.id.chat_id,
+			3: string(json_str)})
+	return err
 }
 
 const ALL_DEVICES = "all"
@@ -437,6 +549,25 @@ func (pool *Pool) SetClientFilter(client *PoolClient, value string) error {
 func (pool *Pool) internalAuthSuccess(tsk wc.ITask) {
 	cl := pool.ByWCRef(tsk.GetClient())
 	pool.broadcastEvent(cl, intrfAuth, []any{})
+
+	if cl != nil {
+		const MSG_STAMP_COL = "msg_stamp"
+		const REC_STAMP_COL = "rec_stamp"
+
+		cols, err := pool.getstamps_stmt.DoSelectRow(
+			map[int]any{1: cl.id.user_id,
+				2: cl.id.chat_id,
+				3: cl.account.Username()},
+			[]string{MSG_STAMP_COL, REC_STAMP_COL})
+		if err != nil {
+			return
+		}
+
+		if cols != nil {
+			cl.GetWCClient().SetLstMsgStamp(cols[MSG_STAMP_COL])
+			cl.GetWCClient().SetLstRecStamp(cols[REC_STAMP_COL])
+		}
+	}
 }
 
 func (pool *Pool) internalOnLog(client *wc.WCClient, value string) {
@@ -462,6 +593,24 @@ func (pool *Pool) internalOnClientStateChange(client *wc.WCClient, status wc.Cli
 func (pool *Pool) internalOnUpdateMsgs(tsk wc.ITask, jsonresult []map[string]any) {
 	cl := tsk.GetUserData().(*PoolClient)
 	pool.broadcastEvent(cl, intrfUpdateMsgs, []any{jsonresult})
+	if cl != nil {
+		for _, msg := range jsonresult {
+			var msg_r wc.MessageStruct
+			msg_r.JSONDecode(msg)
+
+			upd := WCUpdate{
+				Client: cl,
+				Type:   Message,
+				Msg:    &msg_r}
+			pool.updates <- upd
+		}
+
+		pool.updmsgstamp_stmt.DoUpdate(
+			map[int]any{1: cl.id.user_id,
+				2: cl.id.chat_id,
+				3: cl.account.Username(),
+				4: cl.GetWCClient().GetLstMsgStamp()})
+	}
 }
 
 func (pool *Pool) internalOnUpdateDevices(tsk wc.ITask, jsonresult []map[string]any) {
@@ -542,24 +691,23 @@ func (pool *Pool) ByUCID(id TgUserId) *PoolClient {
 }
 
 func (pool *Pool) GetLastLoginData(client *PoolClient) (string, string, error) {
-	pool.stmtmux.Lock()
-	defer pool.stmtmux.Unlock()
+	const NAME_COL = "name"
+	const PWD_COL = "pwd"
 
-	pool.getlogin_stmt.BindInt64(1, client.id.user_id)
-	pool.getlogin_stmt.BindInt64(2, client.id.chat_id)
-	if hasRow, err := pool.getlogin_stmt.Step(); err != nil {
-		return "", "", err
-	} else if !hasRow {
-		err := pool.getlogin_stmt.Reset()
-		return "", "", err
-	}
-	un := pool.getlogin_stmt.GetText("name")
-	pwd := pool.getlogin_stmt.GetText("pwd")
-	err := pool.getlogin_stmt.Reset()
-	if err != nil {
+	cols, err := pool.getlogin_stmt.DoSelectRow(
+		map[int]any{1: client.id.user_id,
+			2: client.id.chat_id},
+		[]string{NAME_COL, PWD_COL})
+	if err != nil && (err != sqlitex.ErrNoResults) {
 		return "", "", err
 	}
-	return un, pwd, nil
+
+	if cols != nil {
+		un := cols[NAME_COL]
+		pwd := cols[PWD_COL]
+		return un, pwd, nil
+	}
+	return "", "", nil
 }
 
 type FilterPoolFunc func(c *PoolClient) bool

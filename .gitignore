@@ -1,4 +1,5 @@
 .vscode
 gotgbotwc
+go-tg-bot-wc
 config.json
 bot.sqlite

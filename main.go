@@ -7,9 +7,10 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
-	wc "github.com/ilya2ik/wcwebcamclient_go/lib"
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	wc "github.com/ilya2ik/wcwebcamclient_go"
 )
 
 func check(e error) {
@@ -72,13 +73,13 @@ func FormatTable(header []string, rows [][]string) string {
 	table.WriteString("```\n")
 	cols := make([]int, len(rows))
 	for j, col := range header {
-		cols[j] = len(col) + 2
+		cols[j] = len([]rune(col)) + 2
 	}
 	var rowcnt int
 	for j, col := range rows {
 		rowcnt = len(col)
 		for _, cell := range col {
-			lv := len(cell) + 2
+			lv := len([]rune(cell)) + 2
 			if lv > cols[j] {
 				cols[j] = lv
 			}
@@ -93,16 +94,16 @@ func FormatTable(header []string, rows [][]string) string {
 	}
 	table.WriteString("\n")
 	table.WriteString("|")
-	for j, _ := range header {
+	for j := range header {
 		table.WriteString(strings.Repeat("-", cols[j]))
 		table.WriteString("|")
 	}
 	for i := 0; i < rowcnt; i++ {
 		table.WriteString("\n")
 		table.WriteString("|")
-		for j, _ := range rows {
+		for j := range rows {
 			cell := rows[j][i]
-			l := len(cell)
+			l := len([]rune(cell))
 			s := " " + cell + strings.Repeat(" ", cols[j]-l-1)
 			table.WriteString(s)
 			table.WriteString("|")
@@ -193,128 +194,186 @@ func main() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = wcb_cfg.Timeout
 
+	stop := make(chan int)
 	updates := bot.GetUpdatesChan(u)
-
-	for update := range updates {
-		if update.Message != nil { // If we got a message
-			log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
-
-			tgid := TgUserId{user_id: update.Message.From.ID, chat_id: update.Message.Chat.ID}
-			client := clientpool.ByUCID(tgid)
-
-			if client == nil {
-				client, err = clientpool.AddCID(tgid,
-					update.Message.From.UserName,
-					update.Message.From.FirstName,
-					update.Message.From.LastName)
-				check(err)
-			}
-
+	pooltimer := clientpool.GetPoolTimer()
+	go func() {
+		for wcupd := range pooltimer {
 			var msg tgbotapi.MessageConfig
-			switch update.Message.Text {
-			case "/start":
+			switch wcupd.Type {
+			case Message:
 				{
-					if client.IsAuthorized() {
-						msg = SendAuthorized(update.Message.Chat.ID, update.Message.From.UserName)
-					} else {
-						// if not authorized
-						if client.CanAutoAuthorize() {
-							clientpool.Authorize(client)
-						} else {
-							home_page :=
-								"<b>Hello, my name is tgTowc_bot</b>\n" +
-									"<a href=\"/authorize\">/authorize</a> to start working with the bot"
-							msg = tgbotapi.NewMessage(update.Message.Chat.ID, home_page)
-							msg.ParseMode = "HTML"
-						}
-					}
-				}
-			case "/authorize":
-				{
-					if client.IsAuthorized() {
-						msg = SendAuthorized(update.Message.Chat.ID, update.Message.From.UserName)
-					} else {
-						page := "Your <b>login</b>:"
-						msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
-						msg.ParseMode = "HTML"
-						client.SetStatus(StatusWaitLogin)
-					}
-				}
-			case "/target":
-				{
-					if !client.IsAuthorized() {
-						msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
-					} else {
-						page := fmt.Sprintf("Set <b>target</b> device.\nTo get the list of online devices use the "+
-							"<a href=\"/devices\">/devices</a> request.\n"+
-							"To get all messages from all devices type: <b>all</b>.\nCurrent target: <b>%s</b>",
-							client.GetTarget())
+					client := wcupd.Client
+					cid := client.GetChatID()
 
-						msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
-						msg.ParseMode = "HTML"
-						client.SetStatus(StatusWaitSetTarget)
-					}
-				}
-			case "/filter":
-				{
-					if !client.IsAuthorized() {
-						msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
-					} else {
-						page := fmt.Sprintf("Describe the incoming message filter by device name.\n"+
-							"The filter is set by the regexp expression.\nCurrent filter: <b>%s</b>",
-							client.GetFilter())
+					var table string
+					if len(wcupd.Msg.Params) > 0 {
+						headers := make([]string, 2)
+						headers[0] = "param"
+						headers[1] = "value"
 
-						msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
-						msg.ParseMode = "HTML"
-						client.SetStatus(StatusWaitSetFilter)
+						rows := make([][]string, 2)
+						for i := 0; i < 2; i++ {
+							rows[i] = make([]string, len(wcupd.Msg.Params))
+						}
+
+						var loc = 0
+						for k, v := range wcupd.Msg.Params {
+							rows[0][loc] = k
+							rows[1][loc] = fmt.Sprintf("%v", v)
+							loc++
+						}
+						table = FormatTable(headers, rows)
 					}
-				}
-			case "/devices":
-				{
-					if !client.IsAuthorized() {
-						msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
-					} else {
-						clientpool.UpdateDevices(client)
-					}
-				}
-			default:
-				{
-					switch client.GetStatus() {
-					case StatusWaitLogin:
-						{
-							client.SetLogin(update.Message.Text)
-							page := "Your <b>password</b>:"
-							msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
-							msg.ParseMode = "HTML"
-							client.SetStatus(StatusWaitPassword)
-						}
-					case StatusWaitPassword:
-						{
-							client.SetPwd(update.Message.Text)
-							clientpool.Authorize(client)
-						}
-					case StatusWaitSetTarget:
-						{
-							err = clientpool.SetClientTarget(client, update.Message.Text)
-							check(err)
-							client.SetStatus(StatusAuthorized)
-						}
-					case StatusWaitSetFilter:
-						{
-							err = clientpool.SetClientFilter(client, update.Message.Text)
-							check(err)
-							client.SetStatus(StatusAuthorized)
-						}
-					default:
-						msg = tgbotapi.NewMessage(update.Message.Chat.ID, update.Message.Text)
-					}
+
+					msg = tgbotapi.NewMessage(cid,
+						fmt.Sprintf("`%s`\n`%s`\n%s", wcupd.Msg.Device, wcupd.Msg.Msg, table))
+					msg.ParseMode = "MarkdownV2"
 				}
 			}
 			if len(msg.Text) > 0 {
-				msg.ReplyToMessageID = update.Message.MessageID
-
 				bot.Send(msg)
 			}
 		}
+	}()
+
+	go func() {
+		for update := range updates {
+			if update.Message != nil { // If we got a message
+				log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
+
+				tgid := TgUserId{user_id: update.Message.From.ID, chat_id: update.Message.Chat.ID}
+				client := clientpool.ByUCID(tgid)
+
+				if client == nil {
+					client, err = clientpool.AddCID(tgid,
+						update.Message.From.UserName,
+						update.Message.From.FirstName,
+						update.Message.From.LastName)
+					check(err)
+				}
+
+				var msg tgbotapi.MessageConfig
+				switch update.Message.Text {
+				case "/start":
+					{
+						if client.IsAuthorized() {
+							msg = SendAuthorized(update.Message.Chat.ID, update.Message.From.UserName)
+						} else {
+							// if not authorized
+							if client.CanAutoAuthorize() {
+								clientpool.Authorize(client)
+							} else {
+								home_page :=
+									"<b>Hello, my name is tgTowc_bot</b>\n" +
+										"<a href=\"/authorize\">/authorize</a> to start working with the bot"
+								msg = tgbotapi.NewMessage(update.Message.Chat.ID, home_page)
+								msg.ParseMode = "HTML"
+							}
+						}
+					}
+				case "/authorize":
+					{
+						if client.IsAuthorized() {
+							msg = SendAuthorized(update.Message.Chat.ID, update.Message.From.UserName)
+						} else {
+							page := "Your <b>login</b>:"
+							msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
+							msg.ParseMode = "HTML"
+							client.SetStatus(StatusWaitLogin)
+						}
+					}
+				case "/target":
+					{
+						if !client.IsAuthorized() {
+							msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
+						} else {
+							page := fmt.Sprintf("Set <b>target</b> device.\nTo get the list of online devices use the "+
+								"<a href=\"/devices\">/devices</a> request.\n"+
+								"To get all messages from all devices type: <b>all</b>.\nCurrent target: <b>%s</b>",
+								client.GetTarget())
+
+							msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
+							msg.ParseMode = "HTML"
+							client.SetStatus(StatusWaitSetTarget)
+						}
+					}
+				case "/filter":
+					{
+						if !client.IsAuthorized() {
+							msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
+						} else {
+							page := fmt.Sprintf("Describe the incoming message filter by device name.\n"+
+								"The filter is set by the regexp expression.\nCurrent filter: <b>%s</b>",
+								client.GetFilter())
+
+							msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
+							msg.ParseMode = "HTML"
+							client.SetStatus(StatusWaitSetFilter)
+						}
+					}
+				case "/devices":
+					{
+						if !client.IsAuthorized() {
+							msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
+						} else {
+							clientpool.UpdateDevices(client)
+						}
+					}
+				default:
+					{
+						switch client.GetStatus() {
+						case StatusWaitLogin:
+							{
+								client.SetLogin(update.Message.Text)
+								page := "Your <b>password</b>:"
+								msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
+								msg.ParseMode = "HTML"
+								client.SetStatus(StatusWaitPassword)
+							}
+						case StatusWaitPassword:
+							{
+								client.SetPwd(update.Message.Text)
+								clientpool.Authorize(client)
+							}
+						case StatusWaitSetTarget:
+							{
+								err = clientpool.SetClientTarget(client, update.Message.Text)
+								check(err)
+								client.SetStatus(StatusAuthorized)
+							}
+						case StatusWaitSetFilter:
+							{
+								err = clientpool.SetClientFilter(client, update.Message.Text)
+								check(err)
+								client.SetStatus(StatusAuthorized)
+							}
+						default:
+							msg = tgbotapi.NewMessage(update.Message.Chat.ID, update.Message.Text)
+						}
+					}
+				}
+				if len(msg.Text) > 0 {
+					msg.ReplyToMessageID = update.Message.MessageID
+
+					bot.Send(msg)
+				}
+			}
+		}
+		stop <- 1
+	}()
+
+	for loop := true; loop; {
+		select {
+		case <-stop:
+			{
+				loop = false
+				close(stop)
+				break
+			}
+		default:
+			time.Sleep(250 * time.Millisecond)
+		}
 	}
+
 }
