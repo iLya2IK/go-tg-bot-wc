@@ -6,7 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
-	"strings"
+	"strconv"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -68,87 +68,18 @@ func (a Listener) OnAddLog(client *PoolClient, value string) {
 	}
 }
 
-func FormatTable(header []string, rows [][]string) string {
-	const MAX_LEN = 16
-
-	table := strings.Builder{}
-	table.WriteString("```\n")
-	cols := make([]int, len(rows))
-	for j, col := range header {
-		cols[j] = len([]rune(col)) + 2
-	}
-	var rowcnt int
-	for j, col := range rows {
-		rowcnt = len(col)
-		for _, cell := range col {
-			lv := len([]rune(cell))
-			if lv > MAX_LEN {
-				lv = MAX_LEN
-			}
-			lv+=2
-			if lv > cols[j] {
-				cols[j] = lv
-			}
-		}
-	}
-	table.WriteString("|")
-	for j, col := range header {
-		l := len(col)
-		s := " " + col + strings.Repeat(" ", cols[j]-l-1)
-		table.WriteString(s)
-		table.WriteString("|")
-	}
-	table.WriteString("\n")
-	table.WriteString("|")
-	for j := range header {
-		table.WriteString(strings.Repeat("-", cols[j]))
-		table.WriteString("|")
-	}
-	for i := 0; i < rowcnt; i++ {
-		table.WriteString("\n")
-		table.WriteString("|")
-		for j := range rows {
-			cell := rows[j][i]
-			cellRunes := []rune(cell)
-			l := len(cellRunes)
-			table.WriteString(" ")
-			if l > MAX_LEN {
-				table.WriteString(string(cellRunes[0 : MAX_LEN-3]))
-				table.WriteString("...")
-			} else {
-				table.WriteString(cell)
-			}
-			table.WriteString(strings.Repeat(" ", cols[j]-l-1))
-			table.WriteString("|")
-		}
-	}
-	table.WriteString("\n```")
-	return table.String()
-}
-
 func (a Listener) OnUpdateDevices(client *PoolClient, devices []map[string]any) {
 	if client != nil {
-		headers := make([]string, 2)
-		headers[0] = "name"
-		headers[1] = "meta"
+		headers, rows := MapArrayToTable(devices)
 
-		rows := make([][]string, 2)
-		for i := 0; i < 2; i++ {
-			rows[i] = make([]string, len(devices))
+		if headers != nil {
+			table := FormatTable(headers, rows)
+
+			msg := tgbotapi.NewMessage(client.GetChatID(), table)
+			msg.ParseMode = "MarkdownV2"
+
+			a.bot.Send(msg)
 		}
-
-		for i, dev := range devices {
-			var json_dev wc.DeviceStruct
-			(&(json_dev)).JSONDecode(dev)
-			rows[0][i] = json_dev.Device
-			rows[1][i] = json_dev.Meta
-		}
-		table := FormatTable(headers, rows)
-
-		msg := tgbotapi.NewMessage(client.GetChatID(), table)
-		msg.ParseMode = "MarkdownV2"
-
-		a.bot.Send(msg)
 	}
 }
 
@@ -212,36 +143,40 @@ func main() {
 	pooltimer := clientpool.GetPoolTimer()
 	go func() {
 		for wcupd := range pooltimer {
+			client := wcupd.Client
+			cid := client.GetChatID()
 			var msg tgbotapi.MessageConfig
 			switch wcupd.Type {
 			case Message:
 				{
-					client := wcupd.Client
-					cid := client.GetChatID()
-
 					var table string
-					if len(wcupd.Msg.Params) > 0 {
-						headers := make([]string, 2)
-						headers[0] = "param"
-						headers[1] = "value"
-
-						rows := make([][]string, 2)
-						for i := 0; i < 2; i++ {
-							rows[i] = make([]string, len(wcupd.Msg.Params))
-						}
-
-						var loc = 0
-						for k, v := range wcupd.Msg.Params {
-							rows[0][loc] = k
-							rows[1][loc] = fmt.Sprintf("%v", v)
-							loc++
-						}
+					headers, rows := MapToTable(wcupd.Msg.Params)
+					if headers != nil {
 						table = FormatTable(headers, rows)
 					}
 
 					msg = tgbotapi.NewMessage(cid,
 						fmt.Sprintf("`%s`\n`%s`\n%s", wcupd.Msg.Device, wcupd.Msg.Msg, table))
 					msg.ParseMode = "MarkdownV2"
+				}
+			case Media:
+				{
+					msg = tgbotapi.NewMessage(cid,
+						fmt.Sprintf("<pre>%s</pre>\nNew media\n<pre>%s</pre>\n"+
+							"<a href=\"/getrid_%d\">/getrid_%d</a>",
+							wcupd.Rec.Device, wcupd.Rec.Stamp, int64(wcupd.Rec.Rid), int64(wcupd.Rec.Rid)))
+					msg.ParseMode = "HTML"
+				}
+			case MediaData:
+				{
+					if wcupd.Data.IsEmpty() {
+						msg = tgbotapi.NewMessage(cid,
+							fmt.Sprintf("Error: No such rid %d", wcupd.Data.GetId()))
+						msg.ParseMode = "HTML"
+					} else {
+						media := tgbotapi.NewPhoto(cid, wcupd.Data)
+						bot.Send(media)
+					}
 				}
 			}
 			if len(msg.Text) > 0 {
@@ -251,6 +186,17 @@ func main() {
 	}()
 
 	go func() {
+		//initialization
+		req := tgbotapi.NewSetMyCommands(
+			tgbotapi.BotCommand{Command: "/start", Description: "Start this bot"},
+			tgbotapi.BotCommand{Command: "/authorize", Description: "Try to login as the user"},
+			tgbotapi.BotCommand{Command: "/settings", Description: "View all settings options"},
+			tgbotapi.BotCommand{Command: "/target", Description: "Change the target device"},
+			tgbotapi.BotCommand{Command: "/filter", Description: "Change the incoming filter for devices"},
+		)
+
+		bot.Send(req)
+
 		for update := range updates {
 			if update.Message != nil { // If we got a message
 				log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
@@ -267,7 +213,9 @@ func main() {
 				}
 
 				var msg tgbotapi.MessageConfig
-				switch update.Message.Text {
+				comm, params := ParseCommand(update.Message.Text)
+
+				switch comm {
 				case "/start":
 					{
 						if client.IsAuthorized() {
@@ -301,9 +249,9 @@ func main() {
 						if !client.IsAuthorized() {
 							msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
 						} else {
-							page := fmt.Sprintf("Set <b>target</b> device.\nTo get the list of online devices use the "+
+							page := fmt.Sprintf("Set <b>target</b> device.\nTo get the list of online devices use the\n "+
 								"<a href=\"/devices\">/devices</a> request.\n"+
-								"To get all messages from all devices type: <b>all</b>.\nCurrent target: <b>%s</b>",
+								"To get all messages from all devices use:\n<b>all</b>.\nCurrent target: <b>%s</b>",
 								client.GetTarget())
 
 							msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
@@ -331,6 +279,15 @@ func main() {
 							msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
 						} else {
 							clientpool.UpdateDevices(client)
+						}
+					}
+				case "/getrid":
+					{
+						if len(params) > 0 {
+							rid, err := strconv.ParseInt(params[0], 10, 64)
+							if err == nil {
+								clientpool.DownloadRid(client, rid)
+							}
 						}
 					}
 				default:
@@ -362,7 +319,9 @@ func main() {
 								client.SetStatus(StatusAuthorized)
 							}
 						default:
-							msg = tgbotapi.NewMessage(update.Message.Chat.ID, update.Message.Text)
+							{
+								msg = tgbotapi.NewMessage(update.Message.Chat.ID, update.Message.Text)
+							}
 						}
 					}
 				}

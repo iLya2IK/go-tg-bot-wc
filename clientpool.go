@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"container/list"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"reflect"
 	"sync"
@@ -204,13 +206,17 @@ type WCUpdateType int
 const (
 	Message WCUpdateType = iota
 	Media
+	MediaData
+	MediaMeta
 )
 
 type WCUpdate struct {
 	Client *PoolClient
 	Type   WCUpdateType
 	Msg    *wc.MessageStruct
-	Data   []byte
+	Rec    *wc.MediaStruct
+	Raw    map[string]any
+	Data   *BufferReader
 }
 
 type PoolUpdate chan WCUpdate
@@ -244,7 +250,7 @@ func (stmt *LockableStmt) bind(bindings map[int]any) error {
 		case reflect.String:
 			stmt.stmt.BindText(key, v.(string))
 		default:
-			return fmt.Errorf("Wrong type of binding %d, %v", key, v)
+			return fmt.Errorf("wrong type of binding %d, %v", key, v)
 		}
 	}
 	return nil
@@ -341,7 +347,8 @@ func NewPool(client_db_loc string, cfg *wc.WCClientConfig) (*Pool, error) {
 		"\"last_used\" text default (current_timestamp),"+
 		"\"msg_stamp\" text default '',"+
 		"\"rec_stamp\" text default '',"+
-		"CONSTRAINT fk_ext FOREIGN KEY (ext_user_id, ext_chat_id) REFERENCES users (user_id, chat_id) on delete cascade,"+
+		"CONSTRAINT \"fk_ext\" FOREIGN KEY (\"ext_user_id\", \"ext_chat_id\") "+
+		"REFERENCES \"users\" (\"user_id\", \"chat_id\") on delete cascade,"+
 		"unique (\"ext_user_id\", \"ext_chat_id\", \"name\"));", nil)
 	if err != nil {
 		return nil, err
@@ -356,42 +363,49 @@ func NewPool(client_db_loc string, cfg *wc.WCClientConfig) (*Pool, error) {
 		updates:     make(PoolUpdate, 128),
 	})
 
-	pool.adduser_stmt, err = PrepareStmt(db, "replace into \"users\" "+
-		"(\"user_id\", \"chat_id\", \"user_name\", \"user_first_name\", \"user_second_name\", \"last_start\") "+
-		"values (?1, ?2, ?3, ?4, ?5, current_timestamp);")
-	if err != nil {
+	if pool.adduser_stmt, err = PrepareStmt(db,
+		"with _ex_ as (select * from \"users\" where \"user_id\"=?1 and \"chat_id\" = ?2 limit 1)"+
+			"replace into \"users\" "+
+			"(\"user_id\", \"chat_id\", \"user_name\", \"user_first_name\", \"user_second_name\", \"last_start\", \"settings\") "+
+			"values (?1, ?2, ?3, ?4, ?5, current_timestamp,"+
+			"CASE WHEN EXISTS(select * from _ex_) THEN (select \"settings\" from _ex_) ELSE '{}' end);"); err != nil {
 		return nil, err
 	}
-	pool.upduser_stmt, err = PrepareStmt(db, "update \"users\" set \"settings\"=?3 where \"user_id\"=?1 and \"chat_id\"=?2;")
-	if err != nil {
+	if pool.upduser_stmt, err = PrepareStmt(db,
+		"update \"users\" set \"settings\"=?3 where \"user_id\"=?1 and \"chat_id\"=?2;"); err != nil {
 		return nil, err
 	}
-	pool.getuser_stmt, err = PrepareStmt(db, "select * from \"users\" where \"user_id\"=?1 and \"chat_id\"=?2;")
-	if err != nil {
+	if pool.getuser_stmt, err = PrepareStmt(db,
+		"select * from \"users\" where \"user_id\"=?1 and \"chat_id\"=?2;"); err != nil {
 		return nil, err
 	}
-	pool.addlogin_stmt, err = PrepareStmt(db, "replace into \"logins\" "+
-		"(\"ext_user_id\", \"ext_chat_id\", \"name\", \"pwd\", \"last_used\") "+
-		"values (?1, ?2, ?3, ?4, current_timestamp);")
-	if err != nil {
+	if pool.addlogin_stmt, err = PrepareStmt(db,
+		"with _ex_ as (select * from \"logins\" where \"ext_user_id\"=?1 and \"ext_chat_id\" = ?2 and \"name\" = ?3 limit 1)"+
+			"replace into \"logins\" "+
+			"(\"ext_user_id\", \"ext_chat_id\", \"name\", \"pwd\", \"last_used\", \"msg_stamp\", \"rec_stamp\")"+
+			"values (?1, ?2, ?3, ?4, current_timestamp, "+
+			"CASE WHEN EXISTS(select * from _ex_) THEN (select \"msg_stamp\" from _ex_) ELSE '' end,"+
+			"CASE WHEN EXISTS(select * from _ex_) THEN (select \"rec_stamp\" from _ex_) ELSE '' end);"); err != nil {
 		return nil, err
 	}
-	pool.getlogin_stmt, err = PrepareStmt(db, "select \"name\", \"pwd\", \"last_used\" from \"logins\" "+
-		" where \"ext_user_id\"=?1 and \"ext_chat_id\"=?2 order by \"last_used\" desc;")
-	if err != nil {
+	if pool.getlogin_stmt, err = PrepareStmt(db,
+		"select \"name\", \"pwd\", \"last_used\" from \"logins\" "+
+			" where \"ext_user_id\"=?1 and \"ext_chat_id\"=?2 order by \"last_used\" desc;"); err != nil {
 		return nil, err
 	}
-	pool.updmsgstamp_stmt, err = PrepareStmt(db, "update \"logins\" set \"msg_stamp\"=?4 where \"ext_user_id\"=?1 and \"ext_chat_id\"=?2 and \"name\"=?3;")
-	if err != nil {
+	if pool.updmsgstamp_stmt, err = PrepareStmt(db,
+		"update \"logins\" set \"msg_stamp\"=?4 where "+
+			"\"ext_user_id\"=?1 and \"ext_chat_id\"=?2 and \"name\"=?3;"); err != nil {
 		return nil, err
 	}
-	pool.updrecstamp_stmt, err = PrepareStmt(db, "update \"logins\" set \"rec_stamp\"=?4 where \"ext_user_id\"=?1 and \"ext_chat_id\"=?2 and \"name\"=?3;")
-	if err != nil {
+	if pool.updrecstamp_stmt, err = PrepareStmt(db,
+		"update \"logins\" set \"rec_stamp\"=?4 where "+
+			"\"ext_user_id\"=?1 and \"ext_chat_id\"=?2 and \"name\"=?3;"); err != nil {
 		return nil, err
 	}
-	pool.getstamps_stmt, err = PrepareStmt(db, "select \"msg_stamp\", \"rec_stamp\" from \"logins\" "+
-		" where \"ext_user_id\"=?1 and \"ext_chat_id\"=?2 and \"name\"=?3;")
-	if err != nil {
+	if pool.getstamps_stmt, err = PrepareStmt(db,
+		"select \"msg_stamp\", \"rec_stamp\" from \"logins\" "+
+			" where \"ext_user_id\"=?1 and \"ext_chat_id\"=?2 and \"name\"=?3;"); err != nil {
 		return nil, err
 	}
 
@@ -413,7 +427,9 @@ func (pool *Pool) NewPoolClient(cfg *wc.WCClientConfig, id TgUserId, un, fn, ln 
 	c.SetOnAddLog(pool.internalOnLog)
 	c.SetOnConnected(pool.internalOnClientStateChange)
 	c.SetOnUpdateMsgs(pool.internalOnUpdateMsgs)
+	c.SetOnUpdateRecords(pool.internalOnUpdateRecords)
 	c.SetOnUpdateDevices(pool.internalOnUpdateDevices)
+	c.SetOnReqRecordData(pool.internalOnRecData)
 
 	new_pool_client := &(PoolClient{id: id, user_name: un, account: &url.Userinfo{}, client: c})
 
@@ -430,7 +446,7 @@ func (pool *Pool) GetPoolTimer() PoolUpdate {
 					return true
 				}
 				return false
-			}, pool.UpdateMessages)
+			}, pool.Update)
 
 			time.Sleep(time.Second * 5)
 		}
@@ -451,16 +467,17 @@ func (pool *Pool) dbAddCID(id TgUserId, un, fn, ln string) (PoolClientSettings, 
 
 	if cols != nil {
 		err = json.Unmarshal([]byte(cols[SETTINGS_COL]), &sett)
-		if len(sett.Target) == 0 {
+		if len(sett.Target) == 0 || err != nil {
 			sett.Target = ALL_DEVICES
 		}
-		if len(sett.Filter) == 0 {
+		if len(sett.Filter) == 0 || err != nil {
 			sett.Filter = ALL_FILTER
 		}
 	}
 
 	err = pool.adduser_stmt.DoUpdate(
-		map[int]any{1: id.user_id,
+		map[int]any{
+			1: id.user_id,
 			2: id.chat_id,
 			3: un,
 			4: fn,
@@ -499,7 +516,8 @@ func (pool *Pool) Authorize(client *PoolClient) error {
 	}
 	pw, _ := client.account.Password()
 	err := pool.addlogin_stmt.DoUpdate(
-		map[int]any{1: client.id.user_id,
+		map[int]any{
+			1: client.id.user_id,
 			2: client.id.chat_id,
 			3: client.account.Username(),
 			4: pw})
@@ -510,8 +528,21 @@ func (pool *Pool) UpdateDevices(client *PoolClient) error {
 	return client.client.UpdateDevices(client)
 }
 
+func (pool *Pool) Update(client *PoolClient) {
+	client.client.UpdateMsgs(client)
+	client.client.UpdateRecords(client)
+}
+
 func (pool *Pool) UpdateMessages(client *PoolClient) {
 	client.client.UpdateMsgs(client)
+}
+
+func (pool *Pool) UpdateRecords(client *PoolClient) {
+	client.client.UpdateRecords(client)
+}
+
+func (pool *Pool) DownloadRid(client *PoolClient, rid int64) {
+	client.client.RequestRecord(int(rid), &(RequestedRecord{client: client, rid: rid}))
 }
 
 func (pool *Pool) updateClientSettings(client *PoolClient) error {
@@ -521,7 +552,8 @@ func (pool *Pool) updateClientSettings(client *PoolClient) error {
 	}
 
 	err = pool.upduser_stmt.DoUpdate(
-		map[int]any{1: client.id.user_id,
+		map[int]any{
+			1: client.id.user_id,
 			2: client.id.chat_id,
 			3: string(json_str)})
 	return err
@@ -555,7 +587,8 @@ func (pool *Pool) internalAuthSuccess(tsk wc.ITask) {
 		const REC_STAMP_COL = "rec_stamp"
 
 		cols, err := pool.getstamps_stmt.DoSelectRow(
-			map[int]any{1: cl.id.user_id,
+			map[int]any{
+				1: cl.id.user_id,
 				2: cl.id.chat_id,
 				3: cl.account.Username()},
 			[]string{MSG_STAMP_COL, REC_STAMP_COL})
@@ -601,21 +634,107 @@ func (pool *Pool) internalOnUpdateMsgs(tsk wc.ITask, jsonresult []map[string]any
 			upd := WCUpdate{
 				Client: cl,
 				Type:   Message,
-				Msg:    &msg_r}
+				Msg:    &msg_r,
+				Raw:    msg,
+			}
 			pool.updates <- upd
 		}
 
 		pool.updmsgstamp_stmt.DoUpdate(
-			map[int]any{1: cl.id.user_id,
+			map[int]any{
+				1: cl.id.user_id,
 				2: cl.id.chat_id,
 				3: cl.account.Username(),
 				4: cl.GetWCClient().GetLstMsgStamp()})
 	}
 }
 
+func (pool *Pool) internalOnUpdateRecords(tsk wc.ITask, jsonresult []map[string]any) {
+	cl := tsk.GetUserData().(*PoolClient)
+	pool.broadcastEvent(cl, intrfUpdateRecs, []any{jsonresult})
+	if cl != nil {
+		for _, rec := range jsonresult {
+			var rec_r wc.MediaStruct
+			rec_r.JSONDecode(rec)
+
+			upd := WCUpdate{
+				Client: cl,
+				Type:   Media,
+				Rec:    &rec_r,
+				Raw:    rec,
+			}
+			pool.updates <- upd
+		}
+
+		pool.updrecstamp_stmt.DoUpdate(
+			map[int]any{
+				1: cl.id.user_id,
+				2: cl.id.chat_id,
+				3: cl.account.Username(),
+				4: cl.GetWCClient().GetLstRecStamp()})
+	}
+}
+
 func (pool *Pool) internalOnUpdateDevices(tsk wc.ITask, jsonresult []map[string]any) {
 	cl := tsk.GetUserData().(*PoolClient)
 	pool.broadcastEvent(cl, intrfUpdateDevices, []any{jsonresult})
+}
+
+type RequestedRecord struct {
+	rid    int64
+	client *PoolClient
+}
+
+type BufferReader struct {
+	name string
+	id   int64
+	data *bytes.Buffer
+}
+
+func (reader *BufferReader) IsEmpty() bool {
+	if reader.data == nil {
+		return true
+	}
+	return reader.data.Len() == 0
+}
+
+func (reader *BufferReader) GetId() int64 {
+	return reader.id
+}
+
+// NeedsUpload shows if the file needs to be uploaded.
+func (reader *BufferReader) NeedsUpload() bool {
+	return true
+}
+
+// UploadData gets the file name and an `io.Reader` for the file to be uploaded. This
+// must only be called when the file needs to be uploaded.
+func (reader *BufferReader) UploadData() (string, io.Reader, error) {
+	return reader.name, reader.data, nil
+}
+
+// SendData gets the file data to send when a file does not need to be uploaded. This
+// must only be called when the file does not need to be uploaded.
+func (reader *BufferReader) SendData() string {
+	return fmt.Sprintf("Cant upload %s", reader.name)
+}
+
+func (pool *Pool) internalOnRecData(tsk wc.ITask, data *bytes.Buffer) {
+	cl := tsk.GetUserData().(*RequestedRecord)
+	if cl != nil {
+		dt := BufferReader{name: fmt.Sprintf("rid%d.png", cl.rid), id: cl.rid}
+		if data.Len() < 64 {
+			dt.data = nil
+		} else {
+			dt.data = data
+		}
+		upd := WCUpdate{
+			Client: cl.client,
+			Type:   MediaData,
+			Data:   &dt,
+		}
+		pool.updates <- upd
+	}
 }
 
 func (pool *Pool) PushBack(str *PoolClient) {
@@ -744,6 +863,7 @@ const (
 	intrfConn
 	intrfAddLog
 	intrfUpdateMsgs
+	intrfUpdateRecs
 	intrfUpdateDevices
 )
 
@@ -786,6 +906,13 @@ func (c *Pool) broadcastEvent(client *PoolClient, intf listenerInterface, params
 				auth, ok := cl.(PoolUpdateMsgsListener)
 				if ok {
 					auth.OnUpdateMsgs(client, params[0].([]map[string]any))
+				}
+			}
+		case intrfUpdateRecs:
+			{
+				auth, ok := cl.(PoolUpdateRecsListener)
+				if ok {
+					auth.OnUpdateRecs(client, params[0].([]map[string]any))
 				}
 			}
 		case intrfUpdateDevices:
