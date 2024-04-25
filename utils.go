@@ -134,7 +134,12 @@ func FormatTable(header []string, rows [][][]rune) string {
 }
 
 func ParseCommand(msg string) (string, []string) {
-	seq := strings.Split(msg, "_")
+	var seq []string
+	if strings.Contains(msg, "&") {
+		seq = strings.Split(msg, "&")
+	} else {
+		seq = strings.Split(msg, "_")
+	}
 	if len(seq) > 0 {
 		if strings.HasPrefix(seq[0], "/") {
 			return seq[0], seq[1:]

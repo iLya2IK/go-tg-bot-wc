@@ -125,6 +125,10 @@ func (c *PoolClient) GetChatID() int64 {
 	return c.id.chat_id
 }
 
+func (c *PoolClient) GetID() TgUserId {
+	return c.id
+}
+
 func (c *PoolClient) GetUserName() string {
 	return c.user_name
 }
@@ -413,6 +417,19 @@ func NewPool(client_db_loc string, cfg *wc.WCClientConfig) (*Pool, error) {
 }
 
 func (pool *Pool) NewPoolClient(cfg *wc.WCClientConfig, id TgUserId, un, fn, ln string) (*PoolClient, error) {
+	c, err := pool.InitNewWCClient(cfg, un)
+	if err != nil {
+		return nil, err
+	}
+
+	new_pool_client := &(PoolClient{id: id, user_name: un, account: &url.Userinfo{}, client: c})
+
+	pool.PushBack(new_pool_client)
+
+	return new_pool_client, nil
+}
+
+func (pool *Pool) InitNewWCClient(cfg *wc.WCClientConfig, un string) (*wc.WCClient, error) {
 	var new_cfg *wc.WCClientConfig = wc.ClientCfgNew()
 	new_cfg.AssignFrom(cfg)
 	new_cfg.SetDevice(un)
@@ -431,11 +448,7 @@ func (pool *Pool) NewPoolClient(cfg *wc.WCClientConfig, id TgUserId, un, fn, ln 
 	c.SetOnUpdateDevices(pool.internalOnUpdateDevices)
 	c.SetOnReqRecordData(pool.internalOnRecData)
 
-	new_pool_client := &(PoolClient{id: id, user_name: un, account: &url.Userinfo{}, client: c})
-
-	pool.PushBack(new_pool_client)
-
-	return new_pool_client, nil
+	return c, nil
 }
 
 func (pool *Pool) GetPoolTimer() PoolUpdate {
@@ -511,6 +524,13 @@ func (pool *Pool) AddCID(id TgUserId, un, fn, ln string) (*PoolClient, error) {
 }
 
 func (pool *Pool) Authorize(client *PoolClient) error {
+	if client.GetWCClient().GetClientStatus() == wc.StateDisconnected {
+		c, err := pool.InitNewWCClient(pool.initial_cfg, client.GetUserName())
+		if err != nil {
+			return err
+		}
+		client.client = c
+	}
 	if err := client.authorize(); err != nil {
 		return err
 	}
