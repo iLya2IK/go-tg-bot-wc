@@ -80,7 +80,6 @@ func FormatTable(header []string, rows [][][]rune) string {
 	const MAX_LEN = 16
 
 	table := strings.Builder{}
-	table.WriteString("```\n")
 	cols := make([]int, len(rows))
 	for j, col := range header {
 		cols[j] = len(col) + 2
@@ -129,7 +128,6 @@ func FormatTable(header []string, rows [][][]rune) string {
 			table.WriteString("|")
 		}
 	}
-	table.WriteString("\n```")
 	return table.String()
 }
 
@@ -146,4 +144,17 @@ func ParseCommand(msg string) (string, []string) {
 		}
 	}
 	return msg, nil
+}
+
+func CollapseParams(params []string) {
+	if len(params) > 1 {
+		res := ""
+		for _, v := range params {
+			if len(res) > 0 {
+				res += "_"
+			}
+			res += v
+		}
+		params[0] = res
+	}
 }

@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -101,8 +103,8 @@ func (a Listener) OnUpdateDevices(client *PoolClient, devices []map[string]any) 
 		if headers != nil {
 			table := FormatTable(headers, rows)
 
-			msg := tgbotapi.NewMessage(client.GetChatID(), table)
-			msg.ParseMode = PM_MD2
+			msg := tgbotapi.NewMessage(client.GetChatID(), "<pre>"+table+"</pre>")
+			msg.ParseMode = PM_HTML
 			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons)
 
 			a.bot.Send(msg)
@@ -147,6 +149,7 @@ const TG_COMMAND_SEND_ALL = "/sendall"
 const TG_COMMAND_ADD_PARAM = "/paramadd"
 const TG_COMMAND_DEL_PARAM = "/paramdel"
 const TG_COMMAND_EDIT_PARAM = "/paramedit"
+const TG_COMMAND_TOJSON = "/tojson"
 
 func SendInitCommands(bot *tgbotapi.BotAPI, tid TgUserId) {
 	req := tgbotapi.NewSetMyCommands(
@@ -230,6 +233,19 @@ func GenJSONMessage(msg *wc.OutMessageStruct) (string, error) {
 	return string(b), nil
 }
 
+func GenJSONMessageInline(msg *wc.OutMessageStruct) (string, error) {
+	msg_map := make(map[string]any)
+	msg_map[wc.JSON_RPC_MSG] = msg.Msg
+	if msg.Params != nil && len(msg.Params) > 0 {
+		msg_map[wc.JSON_RPC_PARAMS] = msg.Params
+	}
+	b, err := json.Marshal(msg_map)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
 func DecodeJSONMessage(msg string) (*wc.OutMessageStruct, error) {
 	jsonmap := make(map[string]any)
 	err := json.Unmarshal([]byte(msg), &jsonmap)
@@ -270,6 +286,10 @@ func DecodeJSONMessage(msg string) (*wc.OutMessageStruct, error) {
 	}
 
 	return mr, nil
+}
+
+func FormatOutputMessage(txt string) string {
+	return fmt.Sprintf("<pre><code class=\"language-json\">%s</code></pre>", txt)
 }
 
 func main() {
@@ -328,9 +348,20 @@ func main() {
 						table = FormatTable(headers, rows)
 					}
 
+					json_text, _ := GenJSONMessageInline(
+						&wc.OutMessageStruct{
+							Msg:    wcupd.Msg.Msg,
+							Params: wcupd.Msg.Params,
+						})
+
 					msg = tgbotapi.NewMessage(cid,
-						fmt.Sprintf("`%s`\n`%s`\n%s", wcupd.Msg.Device, wcupd.Msg.Msg, table))
-					msg.ParseMode = PM_MD2
+						fmt.Sprintf("<pre>%s</pre>\nNew message\n<pre>%s</pre>\n<pre>%s</pre>",
+							wcupd.Msg.Device, wcupd.Msg.Msg, table))
+					msg.ParseMode = PM_HTML
+					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup([]tgbotapi.InlineKeyboardButton{
+						tgbotapi.NewInlineKeyboardButtonData("To JSON",
+							TG_COMMAND_TOJSON+"_"+json_text),
+					})
 				}
 			case Media:
 				{
@@ -342,7 +373,7 @@ func main() {
 						msg.ParseMode = PM_HTML
 						msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup([]tgbotapi.InlineKeyboardButton{
 							tgbotapi.NewInlineKeyboardButtonData("Get Media",
-								fmt.Sprintf("/getrid_%d", int64(wcupd.Rec.Rid))),
+								fmt.Sprintf("%s_%d", TG_COMMAND_GETRID, int64(wcupd.Rec.Rid))),
 						})
 					}
 				}
@@ -369,6 +400,8 @@ func main() {
 		//initialization
 		SendInitCommands(bot, TgUserId{0, 0})
 
+		paramCheckRegexp, _ := regexp.Compile("^[a-zA-Z_]+[a-zA-Z_0-9]*$")
+
 		for update := range updates {
 			if update.CallbackQuery != nil { // If we got a callbask
 				tgid := TgUserId{
@@ -380,21 +413,6 @@ func main() {
 				if client != nil {
 					comm, params := ParseCommand(update.CallbackQuery.Data)
 					switch comm {
-					case TG_COMMAND_SEND:
-						{
-							msg := update.CallbackQuery.Message
-							if len(msg.Text) > 0 {
-								wcmsg, err := DecodeJSONMessage(msg.Text)
-								if err == nil {
-									if strings.Compare(client.GetTarget(), ALL_DEVICES) != 0 {
-										wcmsg.Target = client.GetTarget()
-									}
-									client.GetWCClient().SendMsgs(wcmsg)
-									req := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
-									bot.Send(req)
-								}
-							}
-						}
 					case TG_COMMAND_GETRID:
 						{
 							GetRid(clientpool, client, params)
@@ -410,34 +428,102 @@ func main() {
 								bot.Send(req)
 							}
 						}
-					case TG_COMMAND_ADD_PARAM:
+					case TG_COMMAND_TOJSON:
+						{
+							CollapseParams(params)
+							if len(params) > 0 {
+								wcmsg, err := DecodeJSONMessage(params[0])
+								if err == nil {
+									txt, mkp, err := RebuildMessageEditor(wcmsg, client)
+									if err == nil {
+										msg_edit := tgbotapi.NewMessage(
+											client.GetChatID(),
+											FormatOutputMessage(txt))
+										msg_edit.ParseMode = PM_HTML
+										msg_edit.ReplyMarkup = mkp
+										bot.Send(msg_edit)
+										req := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
+										bot.Send(req)
+									}
+								}
+							}
+						}
+					case TG_COMMAND_SEND, TG_COMMAND_ADD_PARAM, TG_COMMAND_EDIT_PARAM, TG_COMMAND_DEL_PARAM:
 						{
 							msg := update.CallbackQuery.Message
 							if len(msg.Text) > 0 {
 								wcmsg, err := DecodeJSONMessage(msg.Text)
 								if err == nil {
-									req := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
-									bot.Send(req)
-
 									cnt := 0
 									if wcmsg.Params != nil {
 										cnt = len(wcmsg.Params)
 									}
 
-									msgr := tgbotapi.NewMessage(client.GetChatID(),
-										fmt.Sprintf(
-											"Set new param name\n"+
-												"<pre>%s</pre>\n"+
-												"/replyid%d",
-											msg.Text,
-											msg.MessageID))
-									msgr.ParseMode = PM_HTML
-									msgr.ReplyToMessageID = msg.MessageID
-									msgr.ReplyMarkup = tgbotapi.ForceReply{
-										ForceReply:            true,
-										InputFieldPlaceholder: fmt.Sprintf("par%d", cnt),
+									switch comm {
+									case TG_COMMAND_SEND:
+										{
+											if strings.Compare(client.GetTarget(), ALL_DEVICES) != 0 {
+												wcmsg.Target = client.GetTarget()
+											}
+											client.GetWCClient().SendMsgs(wcmsg)
+										}
+									case TG_COMMAND_ADD_PARAM:
+										{
+											inline_msg, _ := GenJSONMessageInline(wcmsg)
+
+											msgr := tgbotapi.NewMessage(client.GetChatID(),
+												fmt.Sprintf(
+													"Set new param name %s\n"+
+														"<pre>%s</pre>",
+													TG_COMMAND_ADD_PARAM,
+													inline_msg))
+											msgr.ParseMode = PM_HTML
+											msgr.ReplyMarkup = tgbotapi.ForceReply{
+												ForceReply:            true,
+												InputFieldPlaceholder: fmt.Sprintf("par%d", cnt),
+											}
+											bot.Send(msgr)
+										}
+									case TG_COMMAND_EDIT_PARAM:
+										{
+											if len(params) > 0 {
+												inline_msg, _ := GenJSONMessageInline(wcmsg)
+
+												msgr := tgbotapi.NewMessage(client.GetChatID(),
+													fmt.Sprintf(
+														"Set new param value %s_%s\n"+
+															"<pre>%s</pre>",
+														TG_COMMAND_EDIT_PARAM,
+														params[0],
+														inline_msg))
+												msgr.ParseMode = PM_HTML
+												msgr.ReplyMarkup = tgbotapi.ForceReply{
+													ForceReply:            true,
+													InputFieldPlaceholder: fmt.Sprintf("%v", wcmsg.Params[params[0]]),
+												}
+												bot.Send(msgr)
+											}
+										}
+									case TG_COMMAND_DEL_PARAM:
+										{
+											if wcmsg.Params != nil && len(params) > 0 {
+												delete(wcmsg.Params, params[0])
+
+												txt, mkp, err := RebuildMessageEditor(wcmsg, client)
+												if err == nil {
+													msg_edit := tgbotapi.NewEditMessageTextAndMarkup(client.GetChatID(),
+														update.CallbackQuery.Message.MessageID,
+														FormatOutputMessage(txt),
+														mkp)
+													msg_edit.ParseMode = PM_HTML
+													bot.Send(msg_edit)
+												}
+											}
+										}
 									}
-									bot.Send(msgr)
+
+									req := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
+									bot.Send(req)
 								}
 							}
 						}
@@ -575,51 +661,136 @@ func main() {
 						default:
 							{
 								// check if reply
-								var ind = -1
-
 								if update.Message.ReplyToMessage != nil {
-									ind = strings.Index(update.Message.ReplyToMessage.Text, "/replyid")
-									if ind >= 0 {
-										seq := update.Message.ReplyToMessage.Text[ind+8:]
-										msg_id, err := strconv.ParseInt(seq, 10, 32)
-										if err == nil && (len(update.Message.ReplyToMessage.Entities) > 0) {
-											// extract json obj
-											ent := update.Message.ReplyToMessage.Entities[0]
-											if ent.Type == "pre" {
-												json_txt := string([]rune(update.Message.ReplyToMessage.Text)[ent.Offset : ent.Offset+ent.Length])
-												obj, err := DecodeJSONMessage(json_txt)
-												if obj.Params == nil {
-													obj.Params = make(map[string]any)
+									if err == nil && (len(update.Message.ReplyToMessage.Entities) > 1) {
+										// extract json obj
+										cur_cmd := ""
+										cur_obj := ""
+										for _, ent := range update.Message.ReplyToMessage.Entities {
+											switch ent.Type {
+											case "bot_command":
+												{
+													str := string([]rune(update.Message.ReplyToMessage.Text)[ent.Offset : ent.Offset+ent.Length])
+													cur_cmd, params = ParseCommand(str)
+													CollapseParams(params)
 												}
-												obj.Params[update.Message.Text] = 0
-												if err == nil {
-													txt, mkp, err := RebuildMessageEditor(obj, client)
-													if err == nil {
-														updt := tgbotapi.NewEditMessageText(update.Message.Chat.ID, int(msg_id),
-															fmt.Sprintf("<pre><code class=\"language-json\">%s</code></pre>", txt))
-														updt.ParseMode = PM_HTML
-														bot.Send(updt)
-														updr := tgbotapi.NewEditMessageReplyMarkup(update.Message.Chat.ID, int(msg_id), mkp)
-														bot.Send(updr)
-														// delete user's reply
-														req := tgbotapi.NewDeleteMessage(update.Message.Chat.ID, update.Message.MessageID)
-														bot.Send(req)
-														req = tgbotapi.NewDeleteMessage(update.Message.Chat.ID, update.Message.ReplyToMessage.MessageID)
-														bot.Send(req)
+											case "pre":
+												{
+													cur_obj = string([]rune(update.Message.ReplyToMessage.Text)[ent.Offset : ent.Offset+ent.Length])
+												}
+											}
+										}
+
+										if (len(cur_cmd) > 0) && (len(cur_obj) > 0) {
+											obj, err := DecodeJSONMessage(cur_obj)
+
+											switch cur_cmd {
+											case TG_COMMAND_ADD_PARAM:
+												{
+													param_v := strings.TrimSpace(update.Message.Text)
+													// check params
+													regres := paramCheckRegexp.MatchString(param_v)
+
+													if regres {
+														if obj.Params == nil {
+															obj.Params = make(map[string]any)
+														}
+														obj.Params[update.Message.Text] = 0
+													} else {
+														msg_new := tgbotapi.NewMessage(update.Message.Chat.ID,
+															fmt.Sprintf("Wrong param name: %s", param_v))
+														msg_new.ParseMode = PM_HTML
+														bot.Send(msg_new)
 													}
+												}
+											case TG_COMMAND_EDIT_PARAM:
+												{
+													param_v := strings.TrimSpace(update.Message.Text)
+
+													if obj.Params == nil {
+														obj.Params = make(map[string]any)
+													}
+													// check is boolean
+													boolv, err := strconv.ParseBool(strings.ToLower(param_v))
+													if err == nil {
+														obj.Params[params[0]] = boolv
+														break
+													}
+													// check is int
+													intv, err := strconv.ParseInt(strings.ToLower(param_v), 10, 64)
+													if err == nil {
+														obj.Params[params[0]] = intv
+														break
+													}
+													// check is float
+													floatv, err := strconv.ParseFloat(strings.ToLower(param_v), 64)
+													if err == nil {
+														obj.Params[params[0]] = floatv
+														break
+													}
+													obj.Params[params[0]] = param_v
+													err = nil
+												}
+											}
+											if err == nil {
+												txt, mkp, err := RebuildMessageEditor(obj, client)
+												if err == nil {
+													msg_new := tgbotapi.NewMessage(update.Message.Chat.ID,
+														FormatOutputMessage(txt))
+													msg_new.ParseMode = PM_HTML
+													msg_new.ReplyMarkup = mkp
+													bot.Send(msg_new)
 												}
 											}
 										}
 									}
-								}
-								if ind < 0 {
-									txt, mkp, err := RebuildMessageEditor(&wc.OutMessageStruct{Msg: update.Message.Text}, client)
-									if err == nil {
+								} else {
+									if update.Message.Photo != nil {
+										// try to get the new media and send it to host
+
+										// find best size
+										bst := update.Message.Photo[0]
+										for _, mipmap := range update.Message.Photo {
+											//TODO: move max size value to config file
+											if mipmap.FileSize < 0x32000 { // 200 kB limit
+												bst = mipmap
+											}
+										}
+
+										file, err := bot.GetFile(tgbotapi.FileConfig{FileID: bst.FileID})
+										if err == nil {
+											go func(cl *PoolClient, url tgbotapi.File) {
+												// Get the data
+												resp, err := http.Get(
+													fmt.Sprintf(tgbotapi.FileEndpoint,
+														wcb_cfg.BotToken,
+														url.FilePath))
+												if err != nil {
+													return
+												}
+
+												// Check server response
+												if resp.StatusCode != http.StatusOK {
+													resp.Body.Close()
+													return
+												}
+
+												cl.GetWCClient().SaveRecord(resp.Body, resp.ContentLength, "", nil)
+											}(client, file)
+
+										}
+									} else if update.Message.Text != "" {
+										txt, mkp, err := RebuildMessageEditor(&wc.OutMessageStruct{Msg: update.Message.Text}, client)
+										if err == nil {
+											msg = tgbotapi.NewMessage(update.Message.Chat.ID,
+												FormatOutputMessage(txt))
+											msg.ParseMode = PM_HTML
+											msg.ReplyMarkup = mkp
+										}
+									} else {
 										msg = tgbotapi.NewMessage(update.Message.Chat.ID,
-											fmt.Sprintf("<pre><code class=\"language-json\">%s</code></pre>", txt))
+											"Unsupported message format")
 										msg.ParseMode = PM_HTML
-										// try to compose message
-										msg.ReplyMarkup = mkp
 									}
 								}
 							}
