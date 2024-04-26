@@ -1,3 +1,9 @@
+/*===============================================================*/
+/* The Telegram to WCClient Bot                                  */
+/*                                                               */
+/* Copyright 2024 Ilya Medvedkov                                 */
+/*===============================================================*/
+
 package main
 
 import (
@@ -7,6 +13,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -34,11 +41,12 @@ type WCServer struct {
 }
 
 type BotConfig struct {
-	Database string   `json:"db"`
-	BotToken string   `json:"token"`
-	Timeout  int      `json:"timeout"`
-	Debug    bool     `json:"debug"`
-	WCSrv    WCServer `json:"wcserver"`
+	Database     string   `json:"db"`
+	BotToken     string   `json:"token"`
+	Timeout      int      `json:"timeout"`
+	Debug        bool     `json:"debug"`
+	MaxMediaSize int      `json:"max_media_size"`
+	WCSrv        WCServer `json:"wcserver"`
 }
 
 type Listener struct {
@@ -48,36 +56,40 @@ type Listener struct {
 
 func (a Listener) OnSuccessAuth(client *PoolClient) {
 	if client != nil {
-		page := fmt.Sprintf("Client authorized\n New SID : %s", client.GetWCClient().GetSID())
+		page := fmt.Sprintf(client.GetLocale().ClientAuthorized, client.GetWCClient().GetSID())
 		msg := tgbotapi.NewMessage(client.GetChatID(), page)
 		msg.ParseMode = PM_HTML
 
 		a.bot.Send(msg)
 
-		SendWorkingCommands(a.bot, client.GetID())
+		SendWorkingCommands(a.bot, client.GetID(), client.GetLocale())
 	}
 }
 
 func (a Listener) OnConnected(client *PoolClient, status wc.ClientStatus) {
 	if client != nil {
-		page := fmt.Sprintf("Client status changed\n %s", wc.ClientStatusText(status))
+		page := fmt.Sprintf(client.GetLocale().ClientStatusChanged, wc.ClientStatusText(status))
 		msg := tgbotapi.NewMessage(client.GetChatID(), page)
 		msg.ParseMode = PM_HTML
 
 		a.bot.Send(msg)
 
 		if status == wc.StateDisconnected {
-			SendInitCommands(a.bot, client.GetID())
+			SendInitCommands(a.bot, client.GetID(), client.GetLocale())
 		}
 	}
 }
 
+func DoLog(bot *tgbotapi.BotAPI, chatid int64, value string) {
+	msg := tgbotapi.NewMessage(chatid, value)
+	msg.ParseMode = PM_HTML
+
+	bot.Send(msg)
+}
+
 func (a Listener) OnAddLog(client *PoolClient, value string) {
 	if client != nil {
-		msg := tgbotapi.NewMessage(client.GetChatID(), value)
-		msg.ParseMode = PM_HTML
-
-		a.bot.Send(msg)
+		DoLog(a.bot, client.GetChatID(), value)
 	}
 }
 
@@ -90,14 +102,14 @@ func (a Listener) OnUpdateDevices(client *PoolClient, devices []map[string]any) 
 			name := fmt.Sprintf("%v", dev[wc.JSON_RPC_DEVICE])
 			if strings.Compare(name, client.GetUserName()) != 0 {
 				btn := tgbotapi.NewInlineKeyboardButtonData(
-					fmt.Sprintf("Set target to %s", name),
-					fmt.Sprintf("/target&%s", name))
+					fmt.Sprintf(client.GetLocale().SetTarget, name),
+					fmt.Sprintf("%s&%s", TG_COMMAND_TARG, name))
 				buttons = append(buttons, btn)
 			}
 		}
 		btn := tgbotapi.NewInlineKeyboardButtonData(
-			"Set target to all",
-			"/target&all")
+			client.GetLocale().SetTargetAll,
+			fmt.Sprintf("%s&%s", TG_COMMAND_TARG, ALL_DEVICES))
 		buttons = append(buttons, btn)
 
 		if headers != nil {
@@ -112,18 +124,17 @@ func (a Listener) OnUpdateDevices(client *PoolClient, devices []map[string]any) 
 	}
 }
 
-func SendAuthorized(id int64, un string) tgbotapi.MessageConfig {
+func SendAuthorized(id int64, un string, locale *LanguageStrings) tgbotapi.MessageConfig {
 	// if already authorized
 	msg := tgbotapi.NewMessage(id,
-		fmt.Sprintf("<b>%s</b> is already authorized", un))
+		fmt.Sprintf(locale.AlreadyAuthorized, un))
 	msg.ParseMode = PM_HTML
 	return msg
 }
 
-func Authorize(id int64, un string) tgbotapi.MessageConfig {
+func SendToAuthorize(id int64, un string, locale *LanguageStrings) tgbotapi.MessageConfig {
 	msg := tgbotapi.NewMessage(id,
-		fmt.Sprintf("<b>%s</b> is not authorized\n"+
-			"<a href=\"/authorize\">/authorize</a> to start working with the bot", un))
+		fmt.Sprintf(locale.NotAuthorized, un, TG_COMMAND_AUTH, TG_COMMAND_AUTH))
 	msg.ParseMode = PM_HTML
 	return msg
 }
@@ -132,7 +143,7 @@ func SetTarget(clientpool *Pool, client *PoolClient, trg string) tgbotapi.Messag
 	err := clientpool.SetClientTarget(client, trg)
 	check(err)
 	msg := tgbotapi.NewMessage(client.GetChatID(),
-		fmt.Sprintf("Target updated: %s", trg))
+		fmt.Sprintf(client.GetLocale().TargetUpdated, trg))
 	return msg
 }
 
@@ -151,11 +162,11 @@ const TG_COMMAND_DEL_PARAM = "/paramdel"
 const TG_COMMAND_EDIT_PARAM = "/paramedit"
 const TG_COMMAND_TOJSON = "/tojson"
 
-func SendInitCommands(bot *tgbotapi.BotAPI, tid TgUserId) {
+func SendInitCommands(bot *tgbotapi.BotAPI, tid TgUserId, locale *LanguageStrings) {
 	req := tgbotapi.NewSetMyCommands(
-		tgbotapi.BotCommand{Command: TG_COMMAND_START, Description: "Start this bot"},
-		tgbotapi.BotCommand{Command: TG_COMMAND_AUTH, Description: "Try to login as the user"},
-		tgbotapi.BotCommand{Command: TG_COMMAND_SETTS, Description: "View all settings options"},
+		tgbotapi.BotCommand{Command: TG_COMMAND_START, Description: locale.CommandStart},
+		tgbotapi.BotCommand{Command: TG_COMMAND_AUTH, Description: locale.CommandAuth},
+		tgbotapi.BotCommand{Command: TG_COMMAND_SETTS, Description: locale.CommandSett},
 	)
 	if tid.chat_id != 0 {
 		req.Scope = &tgbotapi.BotCommandScope{Type: "chat", ChatID: tid.chat_id} //, UserID: tid.user_id}
@@ -165,13 +176,13 @@ func SendInitCommands(bot *tgbotapi.BotAPI, tid TgUserId) {
 	bot.Send(req)
 }
 
-func SendWorkingCommands(bot *tgbotapi.BotAPI, tid TgUserId) {
+func SendWorkingCommands(bot *tgbotapi.BotAPI, tid TgUserId, locale *LanguageStrings) {
 	req := tgbotapi.NewSetMyCommands(
-		tgbotapi.BotCommand{Command: TG_COMMAND_LOGOUT, Description: "Log out"},
-		tgbotapi.BotCommand{Command: TG_COMMAND_SETTS, Description: "View all settings options"},
-		tgbotapi.BotCommand{Command: TG_COMMAND_TARG, Description: "Change the target device"},
-		tgbotapi.BotCommand{Command: TG_COMMAND_FILTER, Description: "Change the incoming filter for devices"},
-		tgbotapi.BotCommand{Command: TG_COMMAND_DEVS, Description: "Get list of all online devices"},
+		tgbotapi.BotCommand{Command: TG_COMMAND_LOGOUT, Description: locale.CommandLogOut},
+		tgbotapi.BotCommand{Command: TG_COMMAND_SETTS, Description: locale.CommandSett},
+		tgbotapi.BotCommand{Command: TG_COMMAND_TARG, Description: locale.CommandTarget},
+		tgbotapi.BotCommand{Command: TG_COMMAND_FILTER, Description: locale.CommandFilter},
+		tgbotapi.BotCommand{Command: TG_COMMAND_DEVS, Description: locale.CommandDevs},
 	)
 	req.Scope = &tgbotapi.BotCommandScope{Type: "chat", ChatID: tid.chat_id} //, UserID: tid.user_id}
 	bot.Send(req)
@@ -186,25 +197,25 @@ func RebuildMessageEditor(msg *wc.OutMessageStruct, client *PoolClient) (string,
 
 	var buttons [][]tgbotapi.InlineKeyboardButton
 
-	add := tgbotapi.NewInlineKeyboardButtonData("Add new param", TG_COMMAND_ADD_PARAM)
+	add := tgbotapi.NewInlineKeyboardButtonData(client.GetLocale().AddParam, TG_COMMAND_ADD_PARAM)
 	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(add))
 	if msg.Params != nil {
 		for param, v := range msg.Params {
 			str := string(TG_COMMAND_EDIT_PARAM + " " + fmt.Sprintf("%v", v))
 			edit := tgbotapi.NewInlineKeyboardButtonData(
-				fmt.Sprintf("Edit %s value", param),
+				fmt.Sprintf(client.GetLocale().EditParam, param),
 				TG_COMMAND_EDIT_PARAM+"&"+param)
 			edit.SwitchInlineQueryCurrentChat = &str
 			buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
 				edit,
 				tgbotapi.NewInlineKeyboardButtonData(
-					fmt.Sprintf("Delete %s", param),
+					fmt.Sprintf(client.GetLocale().DeleteParam, param),
 					TG_COMMAND_DEL_PARAM+"&"+param)))
 		}
 	}
 	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
 		tgbotapi.NewInlineKeyboardButtonData(
-			fmt.Sprintf("Send to %s", client.GetTarget()),
+			fmt.Sprintf(client.GetLocale().SendMsgTo, client.GetTarget()),
 			TG_COMMAND_SEND)))
 
 	return txt, tgbotapi.InlineKeyboardMarkup{InlineKeyboard: buttons}, nil
@@ -302,6 +313,13 @@ func main() {
 	check(err)
 	cfgFile.Close()
 
+	if wcb_cfg.MaxMediaSize > 0x200000 {
+		wcb_cfg.MaxMediaSize = 0x200000
+	}
+	if wcb_cfg.MaxMediaSize < 0x800 {
+		wcb_cfg.MaxMediaSize = 0x800
+	}
+
 	cfg := wc.ClientCfgNew()
 	if len(wcb_cfg.WCSrv.Host) > 0 {
 		cfg.SetHostURL(wcb_cfg.WCSrv.Host)
@@ -338,7 +356,6 @@ func main() {
 		for wcupd := range pooltimer {
 			client := wcupd.Client
 			cid := client.GetChatID()
-			var msg tgbotapi.MessageConfig
 			switch wcupd.Type {
 			case Message:
 				{
@@ -354,78 +371,88 @@ func main() {
 							Params: wcupd.Msg.Params,
 						})
 
-					msg = tgbotapi.NewMessage(cid,
-						fmt.Sprintf("<pre>%s</pre>\nNew message\n<pre>%s</pre>\n<pre>%s</pre>",
-							wcupd.Msg.Device, wcupd.Msg.Msg, table))
+					msg := tgbotapi.NewMessage(cid,
+						fmt.Sprintf("<pre>%s</pre>\n%s\n<pre>%s</pre>\n<pre>%s</pre>",
+							wcupd.Msg.Device, client.GetLocale().IncomingMsg,
+							wcupd.Msg.Msg, table))
 					msg.ParseMode = PM_HTML
 					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup([]tgbotapi.InlineKeyboardButton{
-						tgbotapi.NewInlineKeyboardButtonData("To JSON",
+						tgbotapi.NewInlineKeyboardButtonData(
+							client.GetLocale().ToJSON,
 							TG_COMMAND_TOJSON+"_"+json_text),
 					})
+					bot.Send(msg)
 				}
 			case Media:
 				{
 					if strings.Compare(wcupd.Rec.Device, client.GetUserName()) != 0 {
-						msg = tgbotapi.NewMessage(cid,
-							fmt.Sprintf("<pre>%s</pre>\nNew media\n<pre>%s</pre>\n"+
-								"<a href=\"/getrid_%d\">/getrid_%d</a>",
-								wcupd.Rec.Device, wcupd.Rec.Stamp, int64(wcupd.Rec.Rid), int64(wcupd.Rec.Rid)))
+						msg := tgbotapi.NewMessage(cid,
+							fmt.Sprintf("<pre>%s</pre>\n%s\n<pre>%s</pre>\n"+
+								"<a href=\"%s_%d\">%s_%d</a>",
+								wcupd.Rec.Device, client.GetLocale().IncomingMedia,
+								wcupd.Rec.Stamp,
+								TG_COMMAND_GETRID, int64(wcupd.Rec.Rid),
+								TG_COMMAND_GETRID, int64(wcupd.Rec.Rid)))
 						msg.ParseMode = PM_HTML
 						msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup([]tgbotapi.InlineKeyboardButton{
-							tgbotapi.NewInlineKeyboardButtonData("Get Media",
+							tgbotapi.NewInlineKeyboardButtonData(client.GetLocale().GetMedia,
 								fmt.Sprintf("%s_%d", TG_COMMAND_GETRID, int64(wcupd.Rec.Rid))),
 						})
+						bot.Send(msg)
 					}
 				}
 			case MediaData:
 				{
 					if wcupd.Data.IsEmpty() {
-						msg = tgbotapi.NewMessage(cid,
-							fmt.Sprintf("Error: No such rid %d", wcupd.Data.GetId()))
-						msg.ParseMode = PM_HTML
+						DoLog(bot, cid,
+							fmt.Sprintf(client.GetLocale().ErrorDetected,
+								fmt.Sprintf(client.GetLocale().NoSuchMediaRID, wcupd.Data.GetId())))
 					} else {
 						media := tgbotapi.NewPhoto(cid, wcupd.Data)
-						media.Caption = fmt.Sprintf("Media rid %d", wcupd.Data.GetId())
+						media.Caption = fmt.Sprintf(client.GetLocale().MediaRID, wcupd.Data.GetId())
 						bot.Send(media)
 					}
 				}
-			}
-			if len(msg.Text) > 0 {
-				bot.Send(msg)
 			}
 		}
 	}()
 
 	go func() {
 		//initialization
-		SendInitCommands(bot, TgUserId{0, 0})
+		SendInitCommands(bot, TgUserId{0, 0}, DefaultLocale())
 
 		paramCheckRegexp, _ := regexp.Compile("^[a-zA-Z_]+[a-zA-Z_0-9]*$")
 
 		for update := range updates {
+			error_str := ""
+			var error_chat_id int64 = 0
 			if update.CallbackQuery != nil { // If we got a callbask
 				tgid := TgUserId{
 					user_id: update.CallbackQuery.From.ID,
 					chat_id: update.CallbackQuery.Message.Chat.ID,
 				}
 				client := clientpool.ByUCID(tgid)
+				error_chat_id = tgid.chat_id
 
 				if client != nil {
+					if !client.IsAuthorized() {
+						msg := SendToAuthorize(tgid.chat_id, client.GetUserName(), client.GetLocale())
+						bot.Send(msg)
+					}
+
 					comm, params := ParseCommand(update.CallbackQuery.Data)
 					switch comm {
 					case TG_COMMAND_GETRID:
 						{
 							GetRid(clientpool, client, params)
-							req := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
-							bot.Send(req)
 						}
 					case TG_COMMAND_TARG:
 						{
 							if len(params) > 0 {
 								msg := SetTarget(clientpool, client, params[0])
 								bot.Send(msg)
-								req := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
-								bot.Send(req)
+							} else {
+								error_str = client.locale.EmptyTarget
 							}
 						}
 					case TG_COMMAND_TOJSON:
@@ -442,9 +469,11 @@ func main() {
 										msg_edit.ParseMode = PM_HTML
 										msg_edit.ReplyMarkup = mkp
 										bot.Send(msg_edit)
-										req := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
-										bot.Send(req)
+									} else {
+										error_str = ErrorToString(err)
 									}
+								} else {
+									error_str = ErrorToString(err)
 								}
 							}
 						}
@@ -473,8 +502,9 @@ func main() {
 
 											msgr := tgbotapi.NewMessage(client.GetChatID(),
 												fmt.Sprintf(
-													"Set new param name %s\n"+
+													"%s %s\n"+
 														"<pre>%s</pre>",
+													client.GetLocale().SetNewParamName,
 													TG_COMMAND_ADD_PARAM,
 													inline_msg))
 											msgr.ParseMode = PM_HTML
@@ -491,8 +521,9 @@ func main() {
 
 												msgr := tgbotapi.NewMessage(client.GetChatID(),
 													fmt.Sprintf(
-														"Set new param value %s_%s\n"+
+														"%s %s_%s\n"+
 															"<pre>%s</pre>",
+														client.GetLocale().SetNewParamValue,
 														TG_COMMAND_EDIT_PARAM,
 														params[0],
 														inline_msg))
@@ -502,6 +533,8 @@ func main() {
 													InputFieldPlaceholder: fmt.Sprintf("%v", wcmsg.Params[params[0]]),
 												}
 												bot.Send(msgr)
+											} else {
+												error_str = client.GetLocale().NoParams
 											}
 										}
 									case TG_COMMAND_DEL_PARAM:
@@ -517,18 +550,24 @@ func main() {
 														mkp)
 													msg_edit.ParseMode = PM_HTML
 													bot.Send(msg_edit)
+												} else {
+													error_str = ErrorToString(err)
 												}
 											}
 										}
 									}
-
-									req := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
-									bot.Send(req)
+								} else {
+									error_str = ErrorToString(err)
 								}
+							} else {
+								error_str = client.GetLocale().EmptyCallback
 							}
 						}
 					}
+
 				}
+				req := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
+				bot.Send(req)
 			}
 			if update.Message != nil { // If we got a message
 				log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
@@ -540,46 +579,52 @@ func main() {
 					client, err = clientpool.AddCID(tgid,
 						update.Message.From.UserName,
 						update.Message.From.FirstName,
-						update.Message.From.LastName)
+						update.Message.From.LastName,
+						GetLocale(update.Message.From.LanguageCode))
 					check(err)
+					SendInitCommands(bot, tgid, client.GetLocale())
 				}
+				error_chat_id = tgid.chat_id
 
-				var msg tgbotapi.MessageConfig
 				comm, params := ParseCommand(update.Message.Text)
 
 				switch comm {
 				case TG_COMMAND_START:
 					{
 						if client.IsAuthorized() {
-							msg = SendAuthorized(update.Message.Chat.ID, update.Message.From.UserName)
+							msg := SendAuthorized(update.Message.Chat.ID, update.Message.From.UserName, client.GetLocale())
+							bot.Send(msg)
 						} else {
 							// if not authorized
 							if client.CanAutoAuthorize() {
 								clientpool.Authorize(client)
 							} else {
-								home_page :=
-									"<b>Hello, my name is tgTowc_bot</b>\n" +
-										"<a href=\"/authorize\">/authorize</a> to start working with the bot"
-								msg = tgbotapi.NewMessage(update.Message.Chat.ID, home_page)
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+									fmt.Sprintf(client.GetLocale().Greetings,
+										TG_COMMAND_AUTH, TG_COMMAND_AUTH))
 								msg.ParseMode = PM_HTML
+								bot.Send(msg)
 							}
 						}
 					}
 				case TG_COMMAND_AUTH:
 					{
 						if client.IsAuthorized() {
-							msg = SendAuthorized(update.Message.Chat.ID, update.Message.From.UserName)
+							msg := SendAuthorized(update.Message.Chat.ID, update.Message.From.UserName, client.GetLocale())
+							bot.Send(msg)
 						} else {
-							page := "Your <b>login</b>:"
-							msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
-							msg.ParseMode = PM_HTML
 							client.SetStatus(StatusWaitLogin)
+
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, client.GetLocale().LoginPrompt)
+							msg.ParseMode = PM_HTML
+							bot.Send(msg)
 						}
 					}
 				case TG_COMMAND_LOGOUT:
 					{
 						if !client.IsAuthorized() {
-							msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
+							msg := SendToAuthorize(update.Message.Chat.ID, update.Message.From.UserName, client.GetLocale())
+							bot.Send(msg)
 						} else {
 							client.GetWCClient().Disconnect()
 						}
@@ -587,36 +632,40 @@ func main() {
 				case TG_COMMAND_TARG:
 					{
 						if !client.IsAuthorized() {
-							msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
+							msg := SendToAuthorize(update.Message.Chat.ID, update.Message.From.UserName, client.GetLocale())
+							bot.Send(msg)
 						} else {
-							page := fmt.Sprintf("Set <b>target</b> device.\nTo get the list of online devices use the\n "+
-								"<a href=\"/devices\">/devices</a> request.\n"+
-								"To get all messages from all devices use:\n<b>all</b>.\nCurrent target: <b>%s</b>",
+							client.SetStatus(StatusWaitSetTarget)
+
+							page := fmt.Sprintf(client.GetLocale().TargetPrompt,
+								TG_COMMAND_DEVS, TG_COMMAND_DEVS,
 								client.GetTarget())
 
-							msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, page)
 							msg.ParseMode = PM_HTML
-							client.SetStatus(StatusWaitSetTarget)
+							bot.Send(msg)
 						}
 					}
 				case TG_COMMAND_FILTER:
 					{
 						if !client.IsAuthorized() {
-							msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
+							msg := SendToAuthorize(update.Message.Chat.ID, update.Message.From.UserName, client.GetLocale())
+							bot.Send(msg)
 						} else {
-							page := fmt.Sprintf("Describe the incoming message filter by device name.\n"+
-								"The filter is set by the regexp expression.\nCurrent filter: <b>%s</b>",
+							page := fmt.Sprintf(client.GetLocale().FilterPrompt,
 								client.GetFilter())
 
-							msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
-							msg.ParseMode = PM_HTML
 							client.SetStatus(StatusWaitSetFilter)
+							msg := tgbotapi.NewMessage(update.Message.Chat.ID, page)
+							msg.ParseMode = PM_HTML
+							bot.Send(msg)
 						}
 					}
 				case TG_COMMAND_DEVS:
 					{
 						if !client.IsAuthorized() {
-							msg = Authorize(update.Message.Chat.ID, update.Message.From.UserName)
+							msg := SendToAuthorize(update.Message.Chat.ID, update.Message.From.UserName, client.GetLocale())
+							bot.Send(msg)
 						} else {
 							clientpool.UpdateDevices(client)
 						}
@@ -631,10 +680,10 @@ func main() {
 						case StatusWaitLogin:
 							{
 								client.SetLogin(update.Message.Text)
-								page := "Your <b>password</b>:"
-								msg = tgbotapi.NewMessage(update.Message.Chat.ID, page)
-								msg.ParseMode = PM_HTML
 								client.SetStatus(StatusWaitPassword)
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID, client.GetLocale().PasswordPrompt)
+								msg.ParseMode = PM_HTML
+								bot.Send(msg)
 							}
 						case StatusWaitPassword:
 							{
@@ -648,15 +697,17 @@ func main() {
 						case StatusWaitSetTarget:
 							{
 								client.SetStatus(StatusAuthorized)
-								msg = SetTarget(clientpool, client, update.Message.Text)
+								msg := SetTarget(clientpool, client, update.Message.Text)
+								bot.Send(msg)
 							}
 						case StatusWaitSetFilter:
 							{
 								err = clientpool.SetClientFilter(client, update.Message.Text)
 								check(err)
 								client.SetStatus(StatusAuthorized)
-								msg = tgbotapi.NewMessage(update.Message.Chat.ID,
-									fmt.Sprintf("Filter updated: %s", update.Message.Text))
+								msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+									fmt.Sprintf(client.GetLocale().FilterUpdated, update.Message.Text))
+								bot.Send(msg)
 							}
 						default:
 							{
@@ -698,7 +749,7 @@ func main() {
 														obj.Params[update.Message.Text] = 0
 													} else {
 														msg_new := tgbotapi.NewMessage(update.Message.Chat.ID,
-															fmt.Sprintf("Wrong param name: %s", param_v))
+															fmt.Sprintf(client.GetLocale().WrongParamName, param_v))
 														msg_new.ParseMode = PM_HTML
 														bot.Send(msg_new)
 													}
@@ -740,6 +791,8 @@ func main() {
 													msg_new.ParseMode = PM_HTML
 													msg_new.ReplyMarkup = mkp
 													bot.Send(msg_new)
+												} else {
+													error_str = ErrorToString(err)
 												}
 											}
 										}
@@ -747,12 +800,10 @@ func main() {
 								} else {
 									if update.Message.Photo != nil {
 										// try to get the new media and send it to host
-
-										// find best size
+										// find the best media size
 										bst := update.Message.Photo[0]
 										for _, mipmap := range update.Message.Photo {
-											//TODO: move max size value to config file
-											if mipmap.FileSize < 0x32000 { // 200 kB limit
+											if mipmap.FileSize < wcb_cfg.MaxMediaSize { // check for limit
 												bst = mipmap
 											}
 										}
@@ -760,6 +811,11 @@ func main() {
 										file, err := bot.GetFile(tgbotapi.FileConfig{FileID: bst.FileID})
 										if err == nil {
 											go func(cl *PoolClient, url tgbotapi.File) {
+												ext := strings.ToUpper(path.Ext(url.FilePath))
+												if len(ext) > 0 {
+													ext = ext[1:]
+												}
+
 												// Get the data
 												resp, err := http.Get(
 													fmt.Sprintf(tgbotapi.FileEndpoint,
@@ -775,33 +831,35 @@ func main() {
 													return
 												}
 
-												cl.GetWCClient().SaveRecord(resp.Body, resp.ContentLength, "", nil)
+												cl.GetWCClient().SaveRecord(resp.Body, resp.ContentLength, ext, nil)
 											}(client, file)
-
+										} else {
+											error_str = ErrorToString(err)
 										}
 									} else if update.Message.Text != "" {
 										txt, mkp, err := RebuildMessageEditor(&wc.OutMessageStruct{Msg: update.Message.Text}, client)
 										if err == nil {
-											msg = tgbotapi.NewMessage(update.Message.Chat.ID,
+											msg := tgbotapi.NewMessage(update.Message.Chat.ID,
 												FormatOutputMessage(txt))
 											msg.ParseMode = PM_HTML
 											msg.ReplyMarkup = mkp
+											msg.ReplyToMessageID = update.Message.MessageID
+											bot.Send(msg)
+										} else {
+											error_str = ErrorToString(err)
 										}
 									} else {
-										msg = tgbotapi.NewMessage(update.Message.Chat.ID,
-											"Unsupported message format")
-										msg.ParseMode = PM_HTML
+										error_str = client.GetLocale().UnsupportedMsg
 									}
 								}
 							}
 						}
 					}
 				}
-				if len(msg.Text) > 0 {
-					msg.ReplyToMessageID = update.Message.MessageID
-
-					bot.Send(msg)
-				}
+			}
+			if len(error_str) > 0 && (error_chat_id > 0) {
+				DoLog(bot, error_chat_id,
+					fmt.Sprintf(DefaultLocale().ErrorDetected, error_str))
 			}
 		}
 		stop <- 1

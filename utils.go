@@ -43,7 +43,7 @@ func MapArrayToTable(mp []map[string]any) ([]string, [][][]rune) {
 
 	obj := mp[0]
 
-	for key, _ := range obj {
+	for key := range obj {
 		okk := true
 		for j := 1; j < row_cnt; j++ {
 			_, ok := mp[j][key]
@@ -157,4 +157,8 @@ func CollapseParams(params []string) {
 		}
 		params[0] = res
 	}
+}
+
+func ErrorToString(err error) string {
+	return fmt.Sprintf("%v", err)
 }

@@ -64,10 +64,16 @@ type PoolClient struct {
 	account   *url.Userinfo
 	setting   PoolClientSettings
 
+	locale *LanguageStrings
+
 	client *wc.WCClient
 }
 
 /* PoolClient impl */
+
+func (c *PoolClient) GetLocale() *LanguageStrings {
+	return c.locale
+}
 
 func (c *PoolClient) GetStatus() PoolClientStatus {
 	c.mux.Lock()
@@ -416,13 +422,13 @@ func NewPool(client_db_loc string, cfg *wc.WCClientConfig) (*Pool, error) {
 	return pool, nil
 }
 
-func (pool *Pool) NewPoolClient(cfg *wc.WCClientConfig, id TgUserId, un, fn, ln string) (*PoolClient, error) {
+func (pool *Pool) NewPoolClient(cfg *wc.WCClientConfig, id TgUserId, un, fn, ln string, local *LanguageStrings) (*PoolClient, error) {
 	c, err := pool.InitNewWCClient(cfg, un)
 	if err != nil {
 		return nil, err
 	}
 
-	new_pool_client := &(PoolClient{id: id, user_name: un, account: &url.Userinfo{}, client: c})
+	new_pool_client := &(PoolClient{id: id, user_name: un, account: &url.Userinfo{}, locale: local, client: c})
 
 	pool.PushBack(new_pool_client)
 
@@ -498,14 +504,14 @@ func (pool *Pool) dbAddCID(id TgUserId, un, fn, ln string) (PoolClientSettings, 
 	return sett, err
 }
 
-func (pool *Pool) AddCID(id TgUserId, un, fn, ln string) (*PoolClient, error) {
+func (pool *Pool) AddCID(id TgUserId, un, fn, ln string, locale *LanguageStrings) (*PoolClient, error) {
 
 	sett, err := pool.dbAddCID(id, un, fn, ln)
 	if err != nil {
 		return nil, err
 	}
 
-	client, err := pool.NewPoolClient(pool.initial_cfg, id, un, fn, ln)
+	client, err := pool.NewPoolClient(pool.initial_cfg, id, un, fn, ln, locale)
 	if err != nil {
 		return nil, err
 	}
