@@ -39,13 +39,11 @@ func (id TgUserId) Compare(src TgUserId) int {
 type PoolClientStatus int
 
 const (
-	StatusWaiting       PoolClientStatus = 1
-	StatusWaitLogin     PoolClientStatus = 2
-	StatusWaitPassword  PoolClientStatus = 3
-	StatusAuthorizing   PoolClientStatus = 4
-	StatusAuthorized    PoolClientStatus = 0x100
-	StatusWaitSetTarget PoolClientStatus = 0x101
-	StatusWaitSetFilter PoolClientStatus = 0x102
+	StatusWaiting      PoolClientStatus = 1
+	StatusWaitLogin    PoolClientStatus = 2
+	StatusWaitPassword PoolClientStatus = 3
+	StatusAuthorizing  PoolClientStatus = 4
+	StatusAuthorized   PoolClientStatus = 0x100
 )
 
 type PoolClientSettings struct {
@@ -70,6 +68,10 @@ type PoolClient struct {
 }
 
 /* PoolClient impl */
+
+func (c *PoolClient) GetSettings() *PoolClientSettings {
+	return &c.setting
+}
 
 func (c *PoolClient) GetLocale() *LanguageStrings {
 	return c.locale
