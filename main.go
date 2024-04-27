@@ -830,20 +830,22 @@ func (a Listener) OnAddLog(client *PoolClient, value string) {
 func (a Listener) OnUpdateDevices(client *PoolClient, devices []map[string]any) {
 	if client != nil {
 		headers, rows := MapArrayToTable(devices)
-		buttons := make([]tgbotapi.InlineKeyboardButton, 0, len(devices))
+		buttons := make([][]tgbotapi.InlineKeyboardButton, 0, len(devices))
 
 		for _, dev := range devices {
 			name := fmt.Sprintf("%v", dev[wc.JSON_RPC_DEVICE])
 			if strings.Compare(name, client.GetUserName()) != 0 {
-				btn := tgbotapi.NewInlineKeyboardButtonData(
-					fmt.Sprintf(client.GetLocale().SetTarget, name),
-					fmt.Sprintf("%s&%s", TG_COMMAND_TARG, name))
+				btn := tgbotapi.NewInlineKeyboardRow(
+					tgbotapi.NewInlineKeyboardButtonData(
+						fmt.Sprintf(client.GetLocale().SetTarget, name),
+						fmt.Sprintf("%s&%s", TG_COMMAND_TARG, name)))
 				buttons = append(buttons, btn)
 			}
 		}
-		btn := tgbotapi.NewInlineKeyboardButtonData(
-			client.GetLocale().SetTargetAll,
-			fmt.Sprintf("%s&%s", TG_COMMAND_TARG, ALL_DEVICES))
+		btn := tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData(
+				client.GetLocale().SetTargetAll,
+				fmt.Sprintf("%s&%s", TG_COMMAND_TARG, ALL_DEVICES)))
 		buttons = append(buttons, btn)
 
 		if headers != nil {
@@ -851,7 +853,7 @@ func (a Listener) OnUpdateDevices(client *PoolClient, devices []map[string]any) 
 
 			msg := tgbotapi.NewMessage(client.GetChatID(), "<pre>"+table+"</pre>")
 			msg.ParseMode = PM_HTML
-			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons)
+			msg.ReplyMarkup = tgbotapi.InlineKeyboardMarkup{InlineKeyboard: buttons}
 
 			a.bot.Send(msg)
 		}
@@ -982,8 +984,7 @@ func main() {
 						error_str = handler.ErrorStr
 					}
 				}
-				req := tgbotapi.NewCallback(update.CallbackQuery.ID, "")
-				bot.Send(req)
+				bot.Send(tgbotapi.NewCallback(update.CallbackQuery.ID, ""))
 			} else if update.Message != nil { // If we got a message
 				if client == nil {
 					// if no client found - add the new one to the pool
