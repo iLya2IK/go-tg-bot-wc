@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/url"
 	"reflect"
+	"regexp"
 	"sync"
 	"time"
 
@@ -49,6 +50,26 @@ const (
 type PoolClientSettings struct {
 	Target string `json:"target"`
 	Filter string `json:"filter"`
+
+	filteregex *regexp.Regexp
+}
+
+func (sett *PoolClientSettings) CheckFilter(device string) bool {
+	if sett.filteregex != nil {
+		return sett.filteregex.MatchString(device)
+	}
+	return true
+}
+
+func (sett *PoolClientSettings) SetFilter(filter string) error {
+	sett.Filter = filter
+	return sett.UpdateFilter()
+}
+
+func (sett *PoolClientSettings) UpdateFilter() error {
+	var err error
+	sett.filteregex, err = regexp.Compile(sett.Filter)
+	return err
 }
 
 /* PoolClient decl */
@@ -495,6 +516,7 @@ func (pool *Pool) dbAddCID(id TgUserId, un, fn, ln string) (PoolClientSettings, 
 			sett.Filter = ALL_FILTER
 		}
 	}
+	sett.UpdateFilter()
 
 	err = pool.adduser_stmt.DoUpdate(
 		map[int]any{
@@ -602,7 +624,10 @@ func (pool *Pool) SetClientFilter(client *PoolClient, value string) error {
 	if len(value) == 0 {
 		value = ALL_FILTER
 	}
-	client.setting.Filter = value
+	err := client.setting.SetFilter(value)
+	if err != nil {
+		return err
+	}
 	return pool.updateClientSettings(client)
 }
 

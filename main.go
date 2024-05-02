@@ -51,6 +51,11 @@ type BotConfig struct {
 	WCSrv        WCServer `json:"wcserver"`
 }
 
+type jsonField struct {
+	name string
+	tp   reflect.Kind
+}
+
 const JSON_FILTER = "filter"
 
 const TG_COMMAND_START = "/start"
@@ -147,22 +152,6 @@ func PrepareToAuthorize(client *PoolClient) tgbotapi.MessageConfig {
 	return msg
 }
 
-func PrepareSetTarget(clientpool *Pool, client *PoolClient, trg string) tgbotapi.MessageConfig {
-	err := clientpool.SetClientTarget(client, trg)
-	check(err)
-	msg := tgbotapi.NewMessage(client.GetChatID(),
-		fmt.Sprintf(client.GetLocale().TargetUpdated, trg))
-	return msg
-}
-
-func PrepareSetFilter(clientpool *Pool, client *PoolClient, trg string) tgbotapi.MessageConfig {
-	err := clientpool.SetClientFilter(client, trg)
-	check(err)
-	msg := tgbotapi.NewMessage(client.GetChatID(),
-		fmt.Sprintf(client.GetLocale().FilterUpdated, trg))
-	return msg
-}
-
 func RebuildMessageEditor(msg *wc.OutMessageStruct, client *PoolClient) (string, tgbotapi.InlineKeyboardMarkup, error) {
 	txt, err := GenJSONMessageText(msg)
 
@@ -256,11 +245,6 @@ func DecodeJSONSettingsText(msg string) (*PoolClientSettings, error) {
 		return nil, err
 	}
 
-	type jsonField struct {
-		name string
-		tp   reflect.Kind
-	}
-
 	decl := []jsonField{
 		{name: wc.JSON_RPC_TARGET, tp: reflect.String},
 		{name: JSON_FILTER, tp: reflect.String},
@@ -322,11 +306,6 @@ func DecodeJSONMessageText(msg string) (*wc.OutMessageStruct, error) {
 	err := json.Unmarshal([]byte(msg), &jsonmap)
 	if err != nil {
 		return nil, err
-	}
-
-	type jsonField struct {
-		name string
-		tp   reflect.Kind
 	}
 
 	decl := []jsonField{
@@ -405,10 +384,10 @@ func ExtractJsonObjFromEntities(msg string, entities []tgbotapi.MessageEntity) (
 type BotHandler struct {
 	Bot        *tgbotapi.BotAPI
 	ChatId     int64
-	Client     *PoolClient // may be nill
-	ClientPool *Pool       // may be nill
-	Command    *string     // may be nill
-	Params     []string    // may be nill
+	Client     *PoolClient // may be nil
+	ClientPool *Pool       // may be nil
+	Command    *string     // may be nil
+	Params     []string    // may be nil
 	ErrorStr   string
 }
 
@@ -418,6 +397,15 @@ func NewHandler(bot *tgbotapi.BotAPI, client *PoolClient) *BotHandler {
 
 func NewCommandHandler(bot *tgbotapi.BotAPI, client *PoolClient, clientpool *Pool, command *string, params []string) *BotHandler {
 	return &BotHandler{Bot: bot, Client: client, ClientPool: clientpool, Command: command, Params: params}
+}
+
+func (handler *BotHandler) CheckFilter(device string) bool {
+	sett := handler.Client.GetSettings()
+	if sett != nil {
+		return sett.CheckFilter(device)
+	} else {
+		return true
+	}
 }
 
 func (handler *BotHandler) GetLocale() *LanguageStrings {
@@ -524,11 +512,41 @@ func (handler *BotHandler) SendSettingsAsJson() {
 	}
 }
 
-func (handler *BotHandler) HandleSetTarget() {
-	if len(handler.Params) > 0 {
-		handler.Send(PrepareSetTarget(handler.ClientPool, handler.Client, handler.Params[0]))
+func (handler *BotHandler) HandleSetTarget(value string) {
+	if len(handler.Params) > 0 || len(value) > 0 {
+		if len(value) == 0 {
+			value = handler.Params[0]
+		}
+
+		err := handler.ClientPool.SetClientTarget(handler.Client, value)
+		if err == nil {
+			msg := tgbotapi.NewMessage(handler.GetChatID(),
+				fmt.Sprintf(handler.GetLocale().TargetUpdated, value))
+			handler.Send(msg)
+		} else {
+			handler.ErrorStr = ErrorToString(err)
+		}
 	} else {
 		handler.HandleSettingsSetTarget(handler.Client.GetSettings())
+	}
+}
+
+func (handler *BotHandler) HandleSetFilter(value string) {
+	if len(handler.Params) > 0 || len(value) > 0 {
+		if len(value) == 0 {
+			value = handler.Params[0]
+		}
+
+		err := handler.ClientPool.SetClientFilter(handler.Client, value)
+		if err == nil {
+			msg := tgbotapi.NewMessage(handler.GetChatID(),
+				fmt.Sprintf(handler.GetLocale().FilterUpdated, value))
+			handler.Send(msg)
+		} else {
+			handler.ErrorStr = ErrorToString(err)
+		}
+	} else {
+		handler.HandleSettingsSetFilter(handler.Client.GetSettings())
 	}
 }
 
@@ -640,10 +658,7 @@ func (handler *BotHandler) HandleOutMessageDoAddParam(wcmsg *wc.OutMessageStruct
 		}
 		wcmsg.Params[param_v] = 0
 	} else {
-		msg_new := tgbotapi.NewMessage(handler.GetChatID(),
-			fmt.Sprintf(handler.GetLocale().WrongParamName, param_v))
-		msg_new.ParseMode = PM_HTML
-		handler.Send(msg_new)
+		handler.ErrorStr = fmt.Sprintf(handler.GetLocale().WrongParamName, param_v)
 	}
 }
 
@@ -693,6 +708,7 @@ func (handler *BotHandler) HandleOutMessageDoEditParam(wcmsg *wc.OutMessageStruc
 		wcmsg.Params[handler.Params[0]] = floatv
 		return
 	}
+	// in the other case there is a string param
 	wcmsg.Params[handler.Params[0]] = param_v
 }
 
@@ -922,12 +938,16 @@ func main() {
 			case Message:
 				{
 					// we'v got a message from some device - proceed
-					handler.HandleWCMessage(&wcupd)
+					if handler.CheckFilter(wcupd.Msg.Device) {
+						handler.HandleWCMessage(&wcupd)
+					}
 				}
 			case Media:
 				{
 					// we'v got a media notification from some device - proceed
-					handler.HandleWCMedia(&wcupd)
+					if handler.CheckFilter(wcupd.Rec.Device) {
+						handler.HandleWCMedia(&wcupd)
+					}
 				}
 			case MediaData:
 				{
@@ -965,11 +985,11 @@ func main() {
 							}
 						case TG_COMMAND_TARG:
 							{
-								handler.HandleSetTarget()
+								handler.HandleSetTarget("")
 							}
 						case TG_COMMAND_FILTER:
 							{
-								handler.HandleSettingsSetFilter(client.GetSettings())
+								handler.HandleSetFilter("")
 							}
 						case TG_COMMAND_MSG_TOJSON:
 							{
@@ -1068,9 +1088,9 @@ func main() {
 									}
 								}
 							} else if update.Message.Photo != nil {
-								// user trying to save the new media object
-								// try to extract the new media from message and send it to the host
-								// find the best media size
+								// user trying to save the new media object.
+								// try to extract the new media from message and send it to the host.
+								// find the best media size.
 								bst := update.Message.Photo[0]
 								for _, mipmap := range update.Message.Photo {
 									if mipmap.FileSize < wcb_cfg.MaxMediaSize { // check for limit
@@ -1097,7 +1117,7 @@ func main() {
 							if ok {
 								// Yes, we have a message in the editor's business logic section
 								handler := NewCommandHandler(bot, client, clientpool, &cur_cmd, params)
-								obj, err := DecodeJSONMessageText(cur_obj) // check if there is outmessage object
+								obj, err := DecodeJSONMessageText(cur_obj) // check if there is an outmessage object
 								if err == nil {
 									switch cur_cmd {
 									case TG_COMMAND_ADD_PARAM:
@@ -1114,16 +1134,16 @@ func main() {
 									}
 									error_str = handler.ErrorStr
 								} else {
-									_, err := DecodeJSONSettingsText(cur_obj) // check if there is settings object
+									_, err := DecodeJSONSettingsText(cur_obj) // check if there is a settings object
 									if err == nil {
 										switch cur_cmd {
 										case TG_COMMAND_TARG:
 											{
-												bot.Send(PrepareSetTarget(clientpool, client, update.Message.Text))
+												handler.HandleSetTarget(update.Message.Text)
 											}
 										case TG_COMMAND_FILTER:
 											{
-												bot.Send(PrepareSetFilter(clientpool, client, update.Message.Text))
+												handler.HandleSetFilter(update.Message.Text)
 											}
 										}
 										if len(handler.ErrorStr) == 0 {
