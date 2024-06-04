@@ -12,9 +12,10 @@ import (
 	"sync"
 	"time"
 
-	sqlite "crawshaw.io/sqlite"
-	sqlitex "crawshaw.io/sqlite/sqlitex"
+	"database/sql"
+
 	wc "github.com/ilya2ik/wcwebcamclient_go"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 type TgUserId struct {
@@ -254,17 +255,16 @@ type WCUpdate struct {
 
 type PoolUpdate chan WCUpdate
 
-/* LockableStmt decl */
+/* StmtWrapper decl */
 
-type LockableStmt struct {
-	mux  sync.Mutex
-	stmt *sqlite.Stmt
+type StmtWrapper struct {
+	stmt *sql.Stmt
 }
 
-/* LockableStmt impl */
+/* StmtWrapper impl */
 
-func PrepareStmt(db *sqlite.Conn, sql string) (*LockableStmt, error) {
-	res := LockableStmt{}
+func PrepareStmt(db *sql.DB, sql string) (*StmtWrapper, error) {
+	res := StmtWrapper{}
 	var err error
 	res.stmt, err = db.Prepare(sql)
 	if err != nil {
@@ -273,60 +273,146 @@ func PrepareStmt(db *sqlite.Conn, sql string) (*LockableStmt, error) {
 	return &res, nil
 }
 
-func (stmt *LockableStmt) bind(bindings map[int]any) error {
-	for key, v := range bindings {
-		switch reflect.TypeOf(v).Kind() {
-		case reflect.Int64, reflect.Int32:
-			stmt.stmt.BindInt64(key, v.(int64))
-		case reflect.Float32, reflect.Float64:
-			stmt.stmt.BindFloat(key, v.(float64))
-		case reflect.String:
-			stmt.stmt.BindText(key, v.(string))
-		default:
-			return fmt.Errorf("wrong type of binding %d, %v", key, v)
-		}
-	}
-	return nil
-}
+func (stmt *StmtWrapper) DoUpdate(bindings []any) error {
 
-func (stmt *LockableStmt) DoUpdate(bindings map[int]any) error {
-	stmt.Lock()
-	defer stmt.UnLock()
-
-	stmt.bind(bindings)
-
-	if _, err := stmt.stmt.Step(); err != nil {
+	if _, err := stmt.stmt.Exec(bindings...); err != nil {
 		return err
 	}
 
-	return stmt.stmt.Reset()
+	return nil
 }
 
-func (stmt *LockableStmt) DoSelectRow(bindings map[int]any, cols []string) (map[string]string, error) {
-	stmt.Lock()
-	defer stmt.UnLock()
+type variantParam struct {
+	name string
+	kind reflect.Kind
+}
 
-	stmt.bind(bindings)
+type variantColumn struct {
+	ct   *variantParam
+	need bool
+}
 
-	if hasRow, err := stmt.stmt.Step(); err != nil {
-		return nil, err
-	} else if hasRow {
-		result := make(map[string]string)
-		for _, rec := range cols {
-			result[rec] = stmt.stmt.GetText(rec)
+type variantScanner struct {
+	dst  map[string]any
+	cols []*variantColumn
+	loc  int
+}
+
+func (vs *variantScanner) Scan(src any) error {
+	ct := vs.cols[vs.loc]
+	if ct.need {
+		switch ct.ct.kind {
+		case reflect.Int64, reflect.Int32, reflect.Int:
+			vs.dst[ct.ct.name] = src.(int64)
+		case reflect.Float32, reflect.Float64:
+			vs.dst[ct.ct.name] = src.(float64)
+		case reflect.String:
+			vs.dst[ct.ct.name] = src.(string)
 		}
-		return result, stmt.stmt.Reset()
 	}
-	return nil, sqlitex.ErrNoResults
+	vs.loc++
+	return nil
 }
 
-func (stmt *LockableStmt) Lock() {
-	stmt.mux.Lock()
+func (stmt *StmtWrapper) doSelectRowsLimited(bindings []any, cols []variantParam, limit int) ([]map[string]any, error) {
+
+	results := make([]map[string]any, 0)
+
+	rows, err := stmt.stmt.Query(bindings...)
+	if err != nil {
+		return nil, err
+	}
+
+	defer rows.Close()
+
+	sql_cols, err := rows.ColumnTypes()
+	if err != nil {
+		return nil, err
+	}
+
+	loc_cols := make([]*variantColumn, len(sql_cols))
+	for i, v := range sql_cols {
+		value := &variantColumn{}
+		k := -1
+		for j, v0 := range cols {
+			if v0.name == v.Name() {
+				value.ct = &cols[j]
+				value.need = true
+				k = j
+				break
+			}
+		}
+		if k < 0 {
+			value.ct = &variantParam{name: v.Name()}
+			value.need = false
+		}
+		loc_cols[i] = value
+	}
+
+	vS := &variantScanner{cols: loc_cols, loc: 0}
+	vsArray := make([]any, len(loc_cols))
+	for i := 0; i < len(loc_cols); i++ {
+		vsArray[i] = vS
+	}
+	cnt := 0
+	for rows.Next() && (cnt < limit || limit < 0) {
+		result := make(map[string]any)
+
+		vS.dst = result
+		vS.loc = 0
+		err := rows.Scan(vsArray...)
+		if err != nil {
+			return nil, err
+		}
+
+		results = append(results, result)
+		cnt++
+	}
+
+	if len(results) > 0 {
+		return results, err
+	}
+	return nil, sql.ErrNoRows
 }
 
-func (stmt *LockableStmt) UnLock() {
-	stmt.mux.Unlock()
+func (stmt *StmtWrapper) DoSelectRow(bindings []any, cols []variantParam) (map[string]any, error) {
+
+	results, err := stmt.doSelectRowsLimited(bindings, cols, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	return results[0], nil
 }
+
+func (stmt *StmtWrapper) DoSelectRows(bindings []any, cols []variantParam) ([]map[string]any, error) {
+
+	results, err := stmt.doSelectRowsLimited(bindings, cols, -1)
+	if err != nil {
+		return nil, err
+	}
+
+	return results, nil
+}
+
+var SETTINGS_COL = variantParam{"settings", reflect.String}
+var MSG_STAMP_COL = variantParam{"msg_stamp", reflect.String}
+var REC_STAMP_COL = variantParam{"rec_stamp", reflect.String}
+var NAME_COL = variantParam{"name", reflect.String}
+var PWD_COL = variantParam{"pwd", reflect.String}
+
+var STATE_COL = variantParam{"state", reflect.String}
+var HASH_COL = variantParam{"hash", reflect.String}
+var EUID_COL = variantParam{"euid", reflect.Int}
+var ECID_COL = variantParam{"ecid", reflect.Int}
+var MUID_COL = variantParam{"muid", reflect.Int}
+var MCID_COL = variantParam{"mcid", reflect.Int}
+var STAT_TOTAL_COL = variantParam{"stat_total", reflect.Int}
+var STAT_WON_COL = variantParam{"stat_won", reflect.Int}
+var USERNAME_COL = variantParam{"user_name", reflect.String}
+var ROOMNAME_COL = variantParam{"roomname", reflect.String}
+var LOCALE_COL = variantParam{"locale", reflect.String}
+var CNT_COL = variantParam{"cnt", reflect.Int}
 
 /* Pool decl */
 
@@ -334,16 +420,16 @@ type Pool struct {
 	mux     sync.Mutex
 	listmux sync.Mutex
 
-	client_db *sqlite.Conn
+	client_db *sql.DB
 	// Prepares
-	adduser_stmt     *LockableStmt
-	getuser_stmt     *LockableStmt
-	upduser_stmt     *LockableStmt
-	addlogin_stmt    *LockableStmt
-	getlogin_stmt    *LockableStmt
-	getstamps_stmt   *LockableStmt
-	updrecstamp_stmt *LockableStmt
-	updmsgstamp_stmt *LockableStmt
+	adduser_stmt     *StmtWrapper
+	getuser_stmt     *StmtWrapper
+	upduser_stmt     *StmtWrapper
+	addlogin_stmt    *StmtWrapper
+	getlogin_stmt    *StmtWrapper
+	getstamps_stmt   *StmtWrapper
+	updrecstamp_stmt *StmtWrapper
+	updmsgstamp_stmt *StmtWrapper
 
 	initial_cfg *wc.WCClientConfig
 
@@ -356,33 +442,33 @@ type Pool struct {
 /* Pool impl */
 
 func NewPool(client_db_loc string, cfg *wc.WCClientConfig) (*Pool, error) {
-	db, err := sqlite.OpenConn(client_db_loc, sqlite.SQLITE_OPEN_READWRITE|sqlite.SQLITE_OPEN_CREATE)
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?mode=rwc", client_db_loc))
 	if err != nil {
 		return nil, err
 	}
-	err = sqlitex.Exec(db, "create table if not exists \"users\" ("+
-		"\"user_id\" int,"+
-		"\"chat_id\" int,"+
-		"\"user_name\" text,"+
-		"\"user_first_name\" text,"+
-		"\"user_second_name\" text,"+
-		"\"last_start\" text default (current_timestamp),"+
-		"\"settings\" text default ('{}'),"+
-		"unique (\"user_id\", \"chat_id\"));", nil)
+	_, err = db.Exec("create table if not exists \"users\" (" +
+		"\"user_id\" int," +
+		"\"chat_id\" int," +
+		"\"user_name\" text," +
+		"\"user_first_name\" text," +
+		"\"user_second_name\" text," +
+		"\"last_start\" text default (current_timestamp)," +
+		"\"settings\" text default ('{}')," +
+		"unique (\"user_id\", \"chat_id\"));")
 	if err != nil {
 		return nil, err
 	}
-	err = sqlitex.Exec(db, "create table if not exists \"logins\" ("+
-		"\"ext_user_id\" int not null,"+
-		"\"ext_chat_id\" int not null,"+
-		"\"name\" text not null,"+
-		"\"pwd\" text,"+
-		"\"last_used\" text default (current_timestamp),"+
-		"\"msg_stamp\" text default '',"+
-		"\"rec_stamp\" text default '',"+
-		"CONSTRAINT \"fk_ext\" FOREIGN KEY (\"ext_user_id\", \"ext_chat_id\") "+
-		"REFERENCES \"users\" (\"user_id\", \"chat_id\") on delete cascade,"+
-		"unique (\"ext_user_id\", \"ext_chat_id\", \"name\"));", nil)
+	_, err = db.Exec("create table if not exists \"logins\" (" +
+		"\"ext_user_id\" int not null," +
+		"\"ext_chat_id\" int not null," +
+		"\"name\" text not null," +
+		"\"pwd\" text," +
+		"\"last_used\" text default (current_timestamp)," +
+		"\"msg_stamp\" text default ''," +
+		"\"rec_stamp\" text default ''," +
+		"CONSTRAINT \"fk_ext\" FOREIGN KEY (\"ext_user_id\", \"ext_chat_id\") " +
+		"REFERENCES \"users\" (\"user_id\", \"chat_id\") on delete cascade," +
+		"unique (\"ext_user_id\", \"ext_chat_id\", \"name\"));")
 	if err != nil {
 		return nil, err
 	}
@@ -498,17 +584,16 @@ func (pool *Pool) GetPoolTimer() PoolUpdate {
 }
 
 func (pool *Pool) dbAddCID(id TgUserId, un, fn, ln string) (PoolClientSettings, error) {
-	const SETTINGS_COL = "settings"
 	var sett PoolClientSettings
 	cols, err := pool.getuser_stmt.DoSelectRow(
-		map[int]any{1: id.user_id, 2: id.chat_id},
-		[]string{SETTINGS_COL})
-	if err != nil && (err != sqlitex.ErrNoResults) {
+		[]any{id.user_id, id.chat_id},
+		[]variantParam{SETTINGS_COL})
+	if err != nil && (err != sql.ErrNoRows) {
 		return sett, err
 	}
 
 	if cols != nil {
-		err = json.Unmarshal([]byte(cols[SETTINGS_COL]), &sett)
+		err = json.Unmarshal([]byte(cols[SETTINGS_COL.name].(string)), &sett)
 		if len(sett.Target) == 0 || err != nil {
 			sett.Target = ALL_DEVICES
 		}
@@ -519,12 +604,12 @@ func (pool *Pool) dbAddCID(id TgUserId, un, fn, ln string) (PoolClientSettings, 
 	sett.UpdateFilter()
 
 	err = pool.adduser_stmt.DoUpdate(
-		map[int]any{
-			1: id.user_id,
-			2: id.chat_id,
-			3: un,
-			4: fn,
-			5: ln})
+		[]any{
+			id.user_id,
+			id.chat_id,
+			un,
+			fn,
+			ln})
 	return sett, err
 }
 
@@ -566,11 +651,11 @@ func (pool *Pool) Authorize(client *PoolClient) error {
 	}
 	pw, _ := client.account.Password()
 	err := pool.addlogin_stmt.DoUpdate(
-		map[int]any{
-			1: client.id.user_id,
-			2: client.id.chat_id,
-			3: client.account.Username(),
-			4: pw})
+		[]any{
+			client.id.user_id,
+			client.id.chat_id,
+			client.account.Username(),
+			pw})
 	return err
 }
 
@@ -602,10 +687,10 @@ func (pool *Pool) updateClientSettings(client *PoolClient) error {
 	}
 
 	err = pool.upduser_stmt.DoUpdate(
-		map[int]any{
-			1: client.id.user_id,
-			2: client.id.chat_id,
-			3: string(json_str)})
+		[]any{
+			client.id.user_id,
+			client.id.chat_id,
+			string(json_str)})
 	return err
 }
 
@@ -636,22 +721,19 @@ func (pool *Pool) internalAuthSuccess(tsk wc.ITask) {
 	pool.broadcastEvent(cl, intrfAuth, []any{})
 
 	if cl != nil {
-		const MSG_STAMP_COL = "msg_stamp"
-		const REC_STAMP_COL = "rec_stamp"
-
 		cols, err := pool.getstamps_stmt.DoSelectRow(
-			map[int]any{
-				1: cl.id.user_id,
-				2: cl.id.chat_id,
-				3: cl.account.Username()},
-			[]string{MSG_STAMP_COL, REC_STAMP_COL})
+			[]any{
+				cl.id.user_id,
+				cl.id.chat_id,
+				cl.account.Username()},
+			[]variantParam{MSG_STAMP_COL, REC_STAMP_COL})
 		if err != nil {
 			return
 		}
 
 		if cols != nil {
-			cl.GetWCClient().SetLstMsgStamp(cols[MSG_STAMP_COL])
-			cl.GetWCClient().SetLstRecStamp(cols[REC_STAMP_COL])
+			cl.GetWCClient().SetLstMsgStamp(cols[MSG_STAMP_COL.name].(string))
+			cl.GetWCClient().SetLstRecStamp(cols[REC_STAMP_COL.name].(string))
 		}
 	}
 }
@@ -694,11 +776,11 @@ func (pool *Pool) internalOnUpdateMsgs(tsk wc.ITask, jsonresult []map[string]any
 		}
 
 		pool.updmsgstamp_stmt.DoUpdate(
-			map[int]any{
-				1: cl.id.user_id,
-				2: cl.id.chat_id,
-				3: cl.account.Username(),
-				4: cl.GetWCClient().GetLstMsgStamp()})
+			[]any{
+				cl.id.user_id,
+				cl.id.chat_id,
+				cl.account.Username(),
+				cl.GetWCClient().GetLstMsgStamp()})
 	}
 }
 
@@ -720,11 +802,11 @@ func (pool *Pool) internalOnUpdateRecords(tsk wc.ITask, jsonresult []map[string]
 		}
 
 		pool.updrecstamp_stmt.DoUpdate(
-			map[int]any{
-				1: cl.id.user_id,
-				2: cl.id.chat_id,
-				3: cl.account.Username(),
-				4: cl.GetWCClient().GetLstRecStamp()})
+			[]any{
+				cl.id.user_id,
+				cl.id.chat_id,
+				cl.account.Username(),
+				cl.GetWCClient().GetLstRecStamp()})
 	}
 }
 
@@ -863,20 +945,17 @@ func (pool *Pool) ByUCID(id TgUserId) *PoolClient {
 }
 
 func (pool *Pool) GetLastLoginData(client *PoolClient) (string, string, error) {
-	const NAME_COL = "name"
-	const PWD_COL = "pwd"
-
 	cols, err := pool.getlogin_stmt.DoSelectRow(
-		map[int]any{1: client.id.user_id,
-			2: client.id.chat_id},
-		[]string{NAME_COL, PWD_COL})
-	if err != nil && (err != sqlitex.ErrNoResults) {
+		[]any{client.id.user_id,
+			client.id.chat_id},
+		[]variantParam{NAME_COL, PWD_COL})
+	if err != nil && (err != sql.ErrNoRows) {
 		return "", "", err
 	}
 
 	if cols != nil {
-		un := cols[NAME_COL]
-		pwd := cols[PWD_COL]
+		un := cols[NAME_COL.name].(string)
+		pwd := cols[PWD_COL.name].(string)
 		return un, pwd, nil
 	}
 	return "", "", nil
