@@ -1,6 +1,7 @@
 package main
 
 type LanguageStrings struct {
+	IETFCode            string
 	Greetings           string
 	ClientAuthorized    string
 	ClientStatusChanged string
@@ -42,6 +43,7 @@ type LanguageStrings struct {
 }
 
 var EN_STRINGS = LanguageStrings{
+	IETFCode: "en",
 	Greetings: "<b>Hello, my name is tgTowc_bot</b>\n" +
 		"<a href=\"%s\">%s</a> to start working with the bot",
 	ClientAuthorized:    "Client authorized\n New SID : %s",

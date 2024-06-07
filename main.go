@@ -113,6 +113,9 @@ func PrepareInitCommands(tid TgUserId, locale *LanguageStrings) tgbotapi.Chattab
 		req.Scope = &tgbotapi.BotCommandScope{Type: "chat", ChatID: tid.chat_id} //, UserID: tid.user_id}
 	} else {
 		req.Scope = &tgbotapi.BotCommandScope{Type: "all_private_chats"}
+		if locale != DefaultLocale() {
+			req.LanguageCode = locale.IETFCode
+		}
 	}
 
 	return req
@@ -165,16 +168,16 @@ func RebuildMessageEditor(msg *wc.OutMessageStruct, client *PoolClient) (string,
 	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(add))
 	if msg.Params != nil {
 		for param, v := range msg.Params {
-			str := string(TG_COMMAND_EDIT_PARAM + " " + fmt.Sprintf("%v", v))
+			str := fmt.Sprintf("%s %v", TG_COMMAND_EDIT_PARAM, v)
 			edit := tgbotapi.NewInlineKeyboardButtonData(
 				fmt.Sprintf(client.GetLocale().EditParam, param),
-				TG_COMMAND_EDIT_PARAM+"&"+param)
+				fmt.Sprintf("%s&%s", TG_COMMAND_EDIT_PARAM, param))
 			edit.SwitchInlineQueryCurrentChat = &str
 			buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
 				edit,
 				tgbotapi.NewInlineKeyboardButtonData(
 					fmt.Sprintf(client.GetLocale().DeleteParam, param),
-					TG_COMMAND_DEL_PARAM+"&"+param)))
+					fmt.Sprintf("%s&%s", TG_COMMAND_DEL_PARAM, param))))
 		}
 	}
 	buttons = append(buttons, tgbotapi.NewInlineKeyboardRow(
@@ -459,7 +462,7 @@ func (handler *BotHandler) HandleWCMessage(wcupd *WCUpdate) {
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup([]tgbotapi.InlineKeyboardButton{
 		tgbotapi.NewInlineKeyboardButtonData(
 			handler.GetLocale().ToJSON,
-			TG_COMMAND_MSG_TOJSON+"_"+json_text),
+			fmt.Sprintf("%s_%s", TG_COMMAND_MSG_TOJSON, json_text)),
 	})
 	handler.Send(msg)
 }
@@ -867,7 +870,7 @@ func (a Listener) OnUpdateDevices(client *PoolClient, devices []map[string]any) 
 		if headers != nil {
 			table := FormatTable(headers, rows)
 
-			msg := tgbotapi.NewMessage(client.GetChatID(), "<pre>"+table+"</pre>")
+			msg := tgbotapi.NewMessage(client.GetChatID(), fmt.Sprintf("<pre>%s</pre>", table))
 			msg.ParseMode = PM_HTML
 			msg.ReplyMarkup = tgbotapi.InlineKeyboardMarkup{InlineKeyboard: buttons}
 
@@ -962,6 +965,8 @@ func main() {
 	go func() {
 		//initialization
 		bot.Send(PrepareInitCommands(TgUserId{0, 0}, DefaultLocale()))
+		// send here commands for other locales:
+		// bot.Send(PrepareInitCommands(TgUserId{0, 0}, &RU_STRINGS))
 
 		for update := range updates {
 			// try to extract ids and find the corresponding client object
